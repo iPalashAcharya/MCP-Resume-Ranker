@@ -5,13 +5,23 @@ All environment variables are read once at startup; app code imports
 """
 from __future__ import annotations
 
-import os
+import json
 from enum import Enum
 from functools import lru_cache
-from typing import List, Optional
+from typing import Optional
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _nested_settings_config(env_prefix: str) -> SettingsConfigDict:
+    """Nested BaseSettings do not inherit the parent's env_file; load the same .env here."""
+    return SettingsConfigDict(
+        env_prefix=env_prefix,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
 # ─── Enums ───────────────────────────────────────────────────────────────────
@@ -36,7 +46,7 @@ class LogFormat(str, Enum):
 # ─── Sub-settings groups ──────────────────────────────────────────────────────
 
 class AWSSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="AWS_", extra="ignore")
+    model_config = _nested_settings_config("AWS_")
 
     access_key_id: Optional[str] = Field(
         default=None,
@@ -56,7 +66,7 @@ class AWSSettings(BaseSettings):
 
 
 class MilvusSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="MILVUS_", extra="ignore")
+    model_config = _nested_settings_config("MILVUS_")
 
     host: str = Field("localhost")
     port: int = Field(19530)
@@ -71,7 +81,7 @@ class MilvusSettings(BaseSettings):
 
 
 class EmbeddingSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="EMBEDDING_", extra="ignore")
+    model_config = _nested_settings_config("EMBEDDING_")
 
     model_name: str = Field("Qwen/Qwen2.5-0.5B-Instruct")
     device: str = Field("cpu")
@@ -81,7 +91,7 @@ class EmbeddingSettings(BaseSettings):
 
 
 class LLMSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="LLM_", extra="ignore")
+    model_config = _nested_settings_config("LLM_")
 
     provider: LLMProvider = Field(LLMProvider.OPENAI)
     model_name: str = Field("qwen/qwen-2.5-72b-instruct")
@@ -92,7 +102,7 @@ class LLMSettings(BaseSettings):
 
 
 class MCPSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="MCP_SERVER_", extra="ignore")
+    model_config = _nested_settings_config("MCP_SERVER_")
 
     name: str = Field("resume-ranker-mcp")
     host: str = Field("0.0.0.0")
@@ -101,7 +111,7 @@ class MCPSettings(BaseSettings):
 
 
 class RAGSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="RAG_", extra="ignore")
+    model_config = _nested_settings_config("RAG_")
 
     top_k: int = Field(20)
     final_rank_k: int = Field(10)
@@ -111,7 +121,7 @@ class RAGSettings(BaseSettings):
 
 
 class RedisSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="REDIS_", extra="ignore")
+    model_config = _nested_settings_config("REDIS_")
 
     host: str = Field("localhost")
     port: int = Field(6379)
@@ -121,11 +131,30 @@ class RedisSettings(BaseSettings):
 
 
 class NodeJSSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="NODEJS_", extra="ignore")
+    model_config = _nested_settings_config("NODEJS_")
 
     backend_url: str = Field("http://localhost:3000")
     api_key: Optional[str] = Field(None)
     webhook_secret: Optional[str] = Field(None)
+
+
+def _csv_or_json_list_str(v: object, *, empty_fallback: str) -> str:
+    """Accept comma-separated text or a JSON array string; normalise to comma-separated."""
+    if v is None:
+        return empty_fallback
+    if isinstance(v, list):
+        return ",".join(str(x).strip() for x in v if str(x).strip())
+    s = str(v).strip()
+    if not s:
+        return empty_fallback
+    if s.startswith("["):
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return ",".join(str(x).strip() for x in parsed if str(x).strip())
+        except json.JSONDecodeError:
+            pass
+    return s
 
 
 # ─── Root Settings ────────────────────────────────────────────────────────────
@@ -150,7 +179,11 @@ class Settings(BaseSettings):
 
     # Security
     api_secret_key: str = Field("change_me_in_production_min_32_chars")
-    allowed_origins: List[str] = Field(default=["http://localhost:3000"])
+    allowed_origins_csv: str = Field(
+        default="http://localhost:3000",
+        validation_alias="ALLOWED_ORIGINS",
+        description="Comma-separated origins, or a JSON array string.",
+    )
 
     # Logging
     log_level: str = Field("INFO")
@@ -161,21 +194,31 @@ class Settings(BaseSettings):
     max_workers: int = Field(4)
     request_timeout: int = Field(60)
     max_resume_size_mb: int = Field(10)
-    supported_formats: List[str] = Field(default=["pdf", "docx", "doc", "txt"])
+    supported_formats_csv: str = Field(
+        default="pdf,docx,doc,txt",
+        validation_alias="SUPPORTED_FORMATS",
+        description="Comma-separated extensions, or a JSON array string.",
+    )
 
-    @field_validator("allowed_origins", mode="before")
+    @field_validator("allowed_origins_csv", mode="before")
     @classmethod
-    def parse_origins(cls, v):
-        if isinstance(v, str):
-            return [o.strip() for o in v.split(",")]
-        return v
+    def _normalize_allowed_origins_csv(cls, v: object) -> str:
+        return _csv_or_json_list_str(v, empty_fallback="http://localhost:3000")
 
-    @field_validator("supported_formats", mode="before")
+    @field_validator("supported_formats_csv", mode="before")
     @classmethod
-    def parse_formats(cls, v):
-        if isinstance(v, str):
-            return [f.strip().lower() for f in v.split(",")]
-        return v
+    def _normalize_supported_formats_csv(cls, v: object) -> str:
+        return _csv_or_json_list_str(v, empty_fallback="pdf,docx,doc,txt")
+
+    @computed_field
+    @property
+    def allowed_origins(self) -> list[str]:
+        return [o.strip() for o in self.allowed_origins_csv.split(",") if o.strip()]
+
+    @computed_field
+    @property
+    def supported_formats(self) -> list[str]:
+        return [f.strip().lower() for f in self.supported_formats_csv.split(",") if f.strip()]
 
     @model_validator(mode="after")
     def validate_secret_key(self) -> "Settings":
