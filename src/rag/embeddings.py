@@ -20,6 +20,41 @@ logger = get_logger(__name__)
 _model_lock = Lock()
 
 
+def _resolve_embedding_device(requested: str) -> str:
+    """Map EMBEDDING_DEVICE to a torch device string; fall back when hardware is missing."""
+    import torch
+
+    r = (requested or "cpu").strip().lower()
+    mps_ok = getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+
+    if r == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if mps_ok:
+            return "mps"
+        return "cpu"
+    if r == "mps":
+        if mps_ok:
+            return "mps"
+        logger.warning(
+            "embeddings.mps_unavailable",
+            message="MPS not available; using CPU",
+        )
+        return "cpu"
+    if r == "cuda":
+        if torch.cuda.is_available():
+            return "cuda"
+        logger.warning(
+            "embeddings.cuda_unavailable",
+            message="CUDA not available; using CPU",
+        )
+        return "cpu"
+    if r == "cpu":
+        return "cpu"
+    logger.warning("embeddings.unknown_device", requested=requested, fallback="cpu")
+    return "cpu"
+
+
 class QwenEmbeddings:
     """
     Dense text embedder using Qwen2.5-0.5B-Instruct.
@@ -27,7 +62,7 @@ class QwenEmbeddings:
     Why Qwen for embeddings:
     - Multilingual support out of the box
     - Instruction-tuned variant follows embed-style prompts
-    - Tiny footprint (0.5B params, ~1 GB RAM on CPU)
+    - Tiny footprint (0.5B params; ~1 GB RAM on CPU, often less wall-time on Apple MPS)
 
     For production at scale consider:
     - BGE-M3 (FlagEmbedding) — SOTA multilingual embedder
@@ -69,9 +104,7 @@ class QwenEmbeddings:
             )
             self._model.eval()
 
-            device = settings.embedding.device
-            if device == "auto":
-                device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = _resolve_embedding_device(settings.embedding.device)
             self._device = device
             self._model.to(device)
             self._loaded = True

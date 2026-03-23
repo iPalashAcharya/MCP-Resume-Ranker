@@ -84,7 +84,10 @@ class EmbeddingSettings(BaseSettings):
     model_config = _nested_settings_config("EMBEDDING_")
 
     model_name: str = Field("Qwen/Qwen2.5-0.5B-Instruct")
-    device: str = Field("cpu")
+    device: str = Field(
+        "mps",
+        description="cpu | mps (Apple Silicon) | cuda | auto (cuda → mps → cpu)",
+    )
     batch_size: int = Field(8)
     max_length: int = Field(512)
     dimension: int = Field(896)
