@@ -38,9 +38,19 @@ class LogFormat(str, Enum):
 class AWSSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AWS_", extra="ignore")
 
-    access_key_id: str = Field(..., description="AWS Access Key ID")
-    secret_access_key: str = Field(..., description="AWS Secret Access Key")
-    region: str = Field("us-east-1")
+    access_key_id: Optional[str] = Field(
+        default=None,
+        description="Optional static key; if omitted, uses ~/.aws/credentials, IAM role, etc.",
+    )
+    secret_access_key: Optional[str] = Field(
+        default=None,
+        description="Optional static secret; must be set together with access_key_id.",
+    )
+    profile: Optional[str] = Field(
+        default=None,
+        description="Named profile from ~/.aws/config (env: AWS_PROFILE).",
+    )
+    region: str = Field("ap-south-1")
     s3_resume_bucket: str = Field(..., description="S3 bucket for resumes")
     s3_jd_bucket: str = Field(..., description="S3 bucket for JDs")
 

@@ -22,11 +22,30 @@ logger = get_logger(__name__)
 
 # ─── Session factory (shared across the process) ─────────────────────────────
 
-_session = aioboto3.Session(
-    aws_access_key_id=settings.aws.access_key_id,
-    aws_secret_access_key=settings.aws.secret_access_key,
-    region_name=settings.aws.region,
-)
+
+def _aioboto_session() -> aioboto3.Session:
+    """Use explicit keys only when both are set; otherwise default credential chain."""
+    region = settings.aws.region
+    ak, sk = settings.aws.access_key_id, settings.aws.secret_access_key
+    if ak and sk:
+        return aioboto3.Session(
+            aws_access_key_id=ak,
+            aws_secret_access_key=sk,
+            region_name=region,
+        )
+    if ak or sk:
+        logger.warning(
+            "s3.session.partial_credentials",
+            message="Both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set to use static keys; "
+            "falling back to shared credentials / instance role.",
+        )
+    kwargs: dict = {"region_name": region}
+    if settings.aws.profile:
+        kwargs["profile_name"] = settings.aws.profile
+    return aioboto3.Session(**kwargs)
+
+
+_session = _aioboto_session()
 
 
 @asynccontextmanager
