@@ -103,26 +103,53 @@ class MilvusVectorStore:
     # ── Connection ────────────────────────────────────────────────────────────
 
     def connect(self) -> None:
-        from pymilvus import connections, utility
+        from pymilvus import connections, db
+        from pymilvus.exceptions import MilvusException
 
         if self._connected:
             return
 
+        # Connect to the built-in database first so we can list/create logical DBs if needed.
         connections.connect(
             alias="default",
             host=settings.milvus.host,
             port=settings.milvus.port,
             user=settings.milvus.user,
             password=settings.milvus.password,
-            db_name=settings.milvus.db_name,
+            db_name="default",
             timeout=30,
         )
+
+        target_db = settings.milvus.db_name or "default"
+        if target_db != "default":
+            try:
+                existing = set(db.list_database())
+            except Exception as exc:
+                logger.warning("milvus.list_database_failed", error=str(exc))
+                existing = set()
+            if target_db not in existing:
+                try:
+                    db.create_database(target_db)
+                    logger.info("milvus.database_created", name=target_db)
+                except MilvusException:
+                    try:
+                        present = target_db in db.list_database()
+                    except Exception:
+                        connections.disconnect("default")
+                        raise
+                    if not present:
+                        connections.disconnect("default")
+                        raise
+                    logger.info("milvus.database_exists", name=target_db)
+
+        db.using_database(target_db)
+
         self._connected = True
         logger.info(
             "milvus.connected",
             host=settings.milvus.host,
             port=settings.milvus.port,
-            db=settings.milvus.db_name,
+            db=target_db,
         )
 
         self._ensure_collections()
