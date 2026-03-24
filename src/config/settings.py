@@ -109,7 +109,7 @@ class LLMSettings(BaseSettings):
     api_key: Optional[str] = Field(None)
     base_url: Optional[str] = Field(None)
     max_tokens: int = Field(2048)
-    temperature: float = Field(0.1)
+    temperature: float = Field(0.0)
 
 
 class MCPSettings(BaseSettings):

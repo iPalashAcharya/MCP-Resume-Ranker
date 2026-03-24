@@ -24,41 +24,53 @@ from src.parsers.jd_parser import JobDescription
 
 logger = get_logger(__name__)
 
+# More context for role/title fit than a tiny chunk; still bounded for token limits.
+_CANDIDATE_EXCERPT_CHARS = 1000
+
+# Final score = formula minus red-flag penalty (see `_apply_deterministic_scoring`).
+_WEIGHT_SKILLS = 0.40
+_WEIGHT_EXPERIENCE = 0.30
+_WEIGHT_EDUCATION = 0.15
+_WEIGHT_OVERALL = 0.15
+_RED_FLAG_PENALTY_PER_ITEM = 5.0
+_RED_FLAG_PENALTY_CAP = 15.0
+
 # ─── System prompt ────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are an expert technical recruiter and AI system specialised in
-candidate ranking. You will be given a job description and a list of candidate profiles
-retrieved from a vector search.
+SYSTEM_PROMPT = """You are a strict technical recruiter scoring candidates against ONE job description.
 
-Your task:
-1. Score each candidate from 0–100 on EACH of these dimensions:
-   - skills_match      : overlap between candidate skills and JD requirements
-   - experience_fit    : years of experience vs. minimum required
-   - education_fit     : education meets or exceeds requirement
-   - overall_relevance : holistic judgment of how well this candidate fits the role
+You receive a job title, required/preferred skills, minimum experience, education expectations,
+responsibilities, and for each candidate: skills, years of experience, education, vector similarity,
+and a text excerpt from their resume.
 
-2. Compute a weighted_score: (skills_match * 0.40) + (experience_fit * 0.30) +
-   (education_fit * 0.15) + (overall_relevance * 0.15)
+Scoring rules (use the FULL 0–100 range; avoid clustering everyone in the 80s–90s):
+- Typical strong-but-not-perfect matches: about 65–85 on relevant dimensions.
+- Reserve 90–100 for rare, near-perfect alignment on title/domain, skills, and experience together.
+- skills_match: overlap and depth vs JD **required** skills (not just keyword overlap).
+- experience_fit: compares candidate years to JD minimum; penalize if leadership/seniority in a **different domain** does not compensate for wrong track.
+- education_fit: meets or exceeds stated education requirements; use 70 if education is unknown from the excerpt.
+- overall_relevance: holistic fit to THIS role — **job title and domain matter**. Examples:
+  • If the JD is for a Web Application Technical Lead and the candidate’s primary leadership is
+    Mobile (or another clearly different product/domain), overall_relevance must be **low** (about 25–55)
+    unless the excerpt shows direct web-app / full-stack technical leadership for similar systems.
+  • Generic “strong engineer” without domain/title fit must not exceed about 75 on overall_relevance.
 
-3. Write a 1-2 sentence `summary` for each candidate explaining the match.
+red_flags:
+- List concrete issues (e.g. title/domain mismatch, missing critical required skills, thin evidence in excerpt).
+- If red_flags is non-empty, **overall_relevance must reflect that** (typically cap overall_relevance at about 60).
 
-4. Flag any `red_flags` (e.g., career gaps, skill mismatch) as a list of strings.
+Return ONLY JSON (no markdown). Use EITHER:
+- a JSON array of objects, one per candidate, OR
+- a single object: {"candidates": [ ... ] }
 
-Return ONLY a valid JSON array, no markdown fences, no extra text:
-[
-  {
-    "s3_key": "...",
-    "candidate_name": "...",
-    "skills_match": 85,
-    "experience_fit": 70,
-    "education_fit": 90,
-    "overall_relevance": 80,
-    "weighted_score": 80.5,
-    "summary": "...",
-    "red_flags": [],
-    "rank": 1
-  }
-]
+Each object MUST include:
+  "s3_key", "candidate_name",
+  "skills_match", "experience_fit", "education_fit", "overall_relevance" (integers 0–100),
+  "summary" (1–2 sentences),
+  "red_flags" (array of strings; [] if none)
+
+You MAY include "weighted_score" but it WILL BE IGNORED — the server recomputes it from the four scores.
+Do not assign rank; the server will sort.
 """
 
 USER_PROMPT_TEMPLATE = """
@@ -76,7 +88,7 @@ Education Requirements: {education_reqs}
 ## Candidates to Rank ({n_candidates} candidates)
 {candidates_json}
 
-Rank all {n_candidates} candidates from most to least suitable. Return full JSON array.
+Score all {n_candidates} candidates with the strict rules above. Return JSON array or {{"candidates": [...]}}.
 """
 
 
@@ -102,6 +114,40 @@ def _get_llm_client() -> AsyncOpenAI:
     )
 
 
+def _clamp_0_100(value: Any, default: float = 50.0) -> float:
+    if value is None:
+        return default
+    try:
+        return max(0.0, min(100.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _apply_deterministic_scoring(row: dict) -> dict:
+    """Clamp subscores and set weighted_score from the agreed formula + red-flag penalty."""
+    row["skills_match"] = _clamp_0_100(row.get("skills_match"), 50.0)
+    row["experience_fit"] = _clamp_0_100(row.get("experience_fit"), 50.0)
+    row["education_fit"] = _clamp_0_100(row.get("education_fit"), 50.0)
+    row["overall_relevance"] = _clamp_0_100(row.get("overall_relevance"), 50.0)
+
+    base = (
+        _WEIGHT_SKILLS * row["skills_match"]
+        + _WEIGHT_EXPERIENCE * row["experience_fit"]
+        + _WEIGHT_EDUCATION * row["education_fit"]
+        + _WEIGHT_OVERALL * row["overall_relevance"]
+    )
+
+    flags = row.get("red_flags")
+    penalty = 0.0
+    if isinstance(flags, list) and flags:
+        penalty = min(_RED_FLAG_PENALTY_CAP, _RED_FLAG_PENALTY_PER_ITEM * len(flags))
+
+    row["weighted_score"] = round(max(0.0, min(100.0, base - penalty)), 2)
+    if penalty > 0:
+        row["weighted_score_before_red_flags"] = round(max(0.0, min(100.0, base)), 2)
+    return row
+
+
 # ─── Ranker ───────────────────────────────────────────────────────────────────
 
 class CandidateRanker:
@@ -118,6 +164,7 @@ class CandidateRanker:
     def _build_user_prompt(self, jd: JobDescription, candidates: List[dict]) -> str:
         candidates_summary = []
         for i, c in enumerate(candidates, 1):
+            excerpt = (c.get("best_chunk") or "")[:_CANDIDATE_EXCERPT_CHARS]
             candidates_summary.append({
                 "index": i,
                 "s3_key": c.get("s3_key", ""),
@@ -126,7 +173,7 @@ class CandidateRanker:
                 "experience_years": c.get("experience_years", 0),
                 "education": c.get("education", []),
                 "vector_similarity_score": round(c.get("score", 0), 4),
-                "relevant_excerpt": c.get("best_chunk", "")[:300],
+                "relevant_excerpt": excerpt,
             })
 
         return USER_PROMPT_TEMPLATE.format(
@@ -197,7 +244,11 @@ class CandidateRanker:
             if not isinstance(ranked, list):
                 raise ValueError("Expected JSON array")
 
-            # Re-sort by weighted_score descending and assign ranks
+            for r in ranked:
+                if isinstance(r, dict):
+                    _apply_deterministic_scoring(r)
+
+            # Re-sort by deterministic weighted_score descending and assign ranks
             ranked.sort(key=lambda x: x.get("weighted_score", 0), reverse=True)
             for i, r in enumerate(ranked, 1):
                 r["rank"] = i
@@ -239,7 +290,6 @@ class CandidateRanker:
         ranked = await self.rerank_with_llm(jd, retrieved_candidates)
 
         # Enrich results with original metadata fields if missing
-        ranked_keys = {r.get("s3_key") for r in ranked}
         retrieval_map = {c["s3_key"]: c for c in retrieved_candidates}
         for r in ranked:
             original = retrieval_map.get(r.get("s3_key"), {})
