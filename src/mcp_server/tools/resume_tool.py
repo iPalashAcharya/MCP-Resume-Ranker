@@ -18,6 +18,8 @@ import hashlib
 import time
 from typing import Optional
 
+from urllib.parse import urlparse
+
 from pydantic import BaseModel, Field
 
 from src.config import get_logger, settings
@@ -73,7 +75,7 @@ async def ingest_resume(params: IngestResumeInput) -> IngestResumeOutput:
     """
     start = time.monotonic()
     bucket = params.s3_bucket or settings.aws.s3_resume_bucket
-    key = params.s3_key
+    key = _normalize_and_guard_resume_key(bucket, params.s3_key)
 
     logger.info("tool.ingest_resume.start", s3_key=key, bucket=bucket)
 
@@ -200,6 +202,31 @@ async def ingest_resume(params: IngestResumeInput) -> IngestResumeOutput:
         logger.exception("tool.ingest_resume.unexpected_error", error=str(exc))
         raise
 
+
+
+def _normalize_and_guard_resume_key(bucket: str, raw_key: str) -> str:
+    """Normalise accepted key formats and enforce the configured dev-prefix guard."""
+    key = raw_key.strip()
+
+    # Accept s3://bucket/path and convert to plain key.
+    if key.startswith("s3://"):
+        parsed = urlparse(key)
+        if parsed.netloc and parsed.netloc != bucket:
+            raise ValueError(f"S3 URI bucket '{parsed.netloc}' does not match configured bucket '{bucket}'")
+        key = parsed.path.lstrip("/")
+
+    # Accept bucket/key and convert to plain key.
+    bucket_prefix = f"{bucket}/"
+    if key.startswith(bucket_prefix):
+        key = key[len(bucket_prefix):]
+
+    allowed_prefix = settings.aws.resume_key_prefix.strip().lstrip("/")
+    if allowed_prefix and not key.startswith(allowed_prefix):
+        raise ValueError(
+            f"Resume key must start with '{allowed_prefix}'. Received: '{key}'"
+        )
+
+    return key
 
 def _derive_resume_id(etag: str, s3_key: str) -> str:
     """Derive a stable, unique resume_id from S3 ETag + key."""

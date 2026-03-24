@@ -18,6 +18,7 @@ import hashlib
 import time
 import uuid
 from typing import List, Optional
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -263,7 +264,7 @@ async def _resolve_jd(params: RankCandidatesInput) -> JobDescription:
 
     # S3 path
     bucket = params.jd_s3_bucket or settings.aws.s3_jd_bucket
-    key = params.jd_s3_key
+    key = _normalize_and_guard_jd_key(bucket, params.jd_s3_key or "")
     meta = await s3_client.head_object(bucket, key)
     jd_id = params.jd_id or _jd_id_from_etag(meta["etag"], key)
     ext = s3_client.infer_file_extension(key)
@@ -275,6 +276,31 @@ async def _resolve_jd(params: RankCandidatesInput) -> JobDescription:
         s3_key=key,
         s3_bucket=bucket,
     )
+
+
+def _normalize_and_guard_jd_key(bucket: str, raw_key: str) -> str:
+    """Normalise accepted key formats and enforce configured JD prefix guard."""
+    key = raw_key.strip()
+
+    # Accept s3://bucket/path and convert to plain key.
+    if key.startswith("s3://"):
+        parsed = urlparse(key)
+        if parsed.netloc and parsed.netloc != bucket:
+            raise ValueError(f"S3 URI bucket '{parsed.netloc}' does not match configured bucket '{bucket}'")
+        key = parsed.path.lstrip("/")
+
+    # Accept bucket/key and convert to plain key.
+    bucket_prefix = f"{bucket}/"
+    if key.startswith(bucket_prefix):
+        key = key[len(bucket_prefix):]
+
+    allowed_prefix = settings.aws.jd_key_prefix.strip().lstrip("/")
+    if allowed_prefix and not key.startswith(allowed_prefix):
+        raise ValueError(
+            f"JD key must start with '{allowed_prefix}'. Received: '{key}'"
+        )
+
+    return key
 
 
 def _jd_id_from_text(text: str) -> str:

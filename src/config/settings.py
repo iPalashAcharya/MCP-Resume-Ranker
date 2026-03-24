@@ -63,6 +63,14 @@ class AWSSettings(BaseSettings):
     region: str = Field("ap-south-1")
     s3_resume_bucket: str = Field(..., description="S3 bucket for resumes")
     s3_jd_bucket: str = Field(..., description="S3 bucket for JDs")
+    resume_key_prefix: str = Field(
+        "development/resumes/",
+        description="Allowed S3 key prefix for resume ingestion (guard rail).",
+    )
+    jd_key_prefix: str = Field(
+        "development/jd/",
+        description="Allowed S3 key prefix for JD ingestion/ranking (guard rail).",
+    )
 
 
 class MilvusSettings(BaseSettings):
