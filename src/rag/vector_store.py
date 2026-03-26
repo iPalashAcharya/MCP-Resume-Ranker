@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import get_logger, settings
+from src.rag.chunker import chunk_text_from_raw
 
 logger = get_logger(__name__)
 
@@ -73,17 +74,11 @@ def _build_schema(fields_def: list, description: str):
 # ─── Chunker ─────────────────────────────────────────────────────────────────
 
 def chunk_text(text: str, chunk_size: int = None, overlap: int = None) -> List[str]:
-    """Split text into overlapping word-level chunks."""
-    chunk_size = chunk_size or settings.rag.chunk_size
-    overlap = overlap or settings.rag.chunk_overlap
-    words = text.split()
-    chunks = []
-    i = 0
-    while i < len(words):
-        chunk = " ".join(words[i : i + chunk_size])
-        chunks.append(chunk)
-        i += chunk_size - overlap
-    return chunks or [text]
+    """
+    Backward-compatible chunking helper.
+    Prefer importing `chunk_text_from_raw` from `src.rag.chunker` directly.
+    """
+    return chunk_text_from_raw(text=text, chunk_size=chunk_size, overlap=overlap)
 
 
 # ─── MilvusVectorStore ────────────────────────────────────────────────────────

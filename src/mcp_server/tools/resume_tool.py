@@ -25,8 +25,9 @@ from pydantic import BaseModel, Field
 from src.config import get_logger, settings
 from src.parsers.resume_parser import resume_parser
 from src.rag.cache import cache
+from src.rag.chunker import chunk_resume_document
 from src.rag.embeddings import embedder
-from src.rag.vector_store import chunk_text, vector_store
+from src.rag.vector_store import vector_store
 from src.s3.client import s3_client
 
 logger = get_logger(__name__)
@@ -123,11 +124,12 @@ async def ingest_resume(params: IngestResumeInput) -> IngestResumeOutput:
         )
 
         # 6. Chunk
-        chunks = chunk_text(
-            doc.full_text,
+        structured_chunks = chunk_resume_document(
+            doc,
             chunk_size=settings.rag.chunk_size,
             overlap=settings.rag.chunk_overlap,
         )
+        chunks = [c.text for c in structured_chunks]
         logger.info("tool.ingest_resume.chunking", resume_id=resume_id, n_chunks=len(chunks))
 
         # 7. Embed (with per-chunk cache)
