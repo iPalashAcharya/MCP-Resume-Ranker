@@ -117,12 +117,12 @@ class QwenEmbeddings:
             )
 
     @staticmethod
-    def _mean_pool(token_embeddings: "torch.Tensor", attention_mask: "torch.Tensor") -> "torch.Tensor":
+    def _mean_pool(token_embeddings: "torch.Tensor", attention_mask: "torch.Tensor") -> "torch.Tensor": # mean pooling is a technique to reduce the dimensionality of the embeddings by averaging the embeddings of the tokens in the sequence
         """Attention-mask-aware mean pooling."""
         import torch
-        mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        return torch.sum(token_embeddings * mask_expanded, 1) / torch.clamp(
-            mask_expanded.sum(1), min=1e-9
+        mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float() # unsqueeze the attention mask to the same size as the token embeddings and convert to float
+        return torch.sum(token_embeddings * mask_expanded, 1) / torch.clamp( # multiple the token embeddings by attention mask, padidng will have attention mask 0 so it will be ignored and sum will be 0 and we will divide by the number of tokens that are not 0 
+            mask_expanded.sum(1), min=1e-9 # get the real tokens from mask_expanded.sum(1) and divide the 
         )
 
     def _embed_batch(self, texts: List[str]) -> np.ndarray:
