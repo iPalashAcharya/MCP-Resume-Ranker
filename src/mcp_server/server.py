@@ -132,6 +132,8 @@ async def tool_ingest_resume(
     description=(
         "Rank candidates from the vector store against a job profile. "
         "Accepts either a raw JD text string or an S3 key pointing to a JD file. "
+        "Optional reference_selected_resume_s3_keys: resumes already selected for this JD "
+        "are sent to the LLM as calibration context only (not ranked). "
         "Returns a ranked list of candidates with LLM-generated scores, summaries, "
         "and red flags."
     ),
@@ -146,6 +148,8 @@ async def tool_rank_candidates(
     required_skills_filter: list[str] | None = None,
     include_presigned_urls: bool = False,
     use_cache: bool = True,
+    reference_selected_resume_s3_keys: list[str] | None = None,
+    resume_s3_bucket: str | None = None,
 ) -> dict:
     """
     Args:
@@ -158,6 +162,8 @@ async def tool_rank_candidates(
         required_skills_filter: Hard filter — candidates must have ALL listed skills
         include_presigned_urls: Return 1-hour pre-signed S3 URLs for each resume
         use_cache: If false, bypass cached ranking and re-run from scratch
+        reference_selected_resume_s3_keys: Optional S3 keys of already-selected resumes (LLM calibration only)
+        resume_s3_bucket: Bucket for those reference resumes (default: resume bucket)
     """
     try:
         result = await rank_candidates_for_job(
@@ -171,6 +177,8 @@ async def tool_rank_candidates(
                 required_skills_filter=required_skills_filter,
                 include_presigned_urls=include_presigned_urls,
                 use_cache=use_cache,
+                reference_selected_resume_s3_keys=reference_selected_resume_s3_keys,
+                resume_s3_bucket=resume_s3_bucket,
             )
         )
         return result.model_dump()

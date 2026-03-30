@@ -129,6 +129,26 @@ class RAGSettings(BaseSettings):
     score_threshold: float = Field(0.3)
     chunk_size: int = Field(512)
     chunk_overlap: int = Field(64)
+    llm_jd_raw_max_chars: int = Field(
+        4000,
+        description="Append verbatim JD excerpt to LLM user prompt; 0 disables.",
+    )
+    llm_per_reference_resume_max_chars: int = Field(
+        4000,
+        description="Max chars per reference profile (already-selected resumes) in the LLM prompt.",
+    )
+    llm_reference_section_max_chars: int = Field(
+        60000,
+        description="Soft cap on total chars across all reference profiles; 0 means no section-level cap.",
+    )
+    llm_user_prompt_max_chars: int = Field(
+        0,
+        description="If > 0, trim JD raw + reference text until the user prompt fits this size.",
+    )
+    max_reference_resume_keys: int = Field(
+        30,
+        description="Maximum S3 keys allowed in reference_selected_resume_s3_keys per request.",
+    )
 
 
 class RedisSettings(BaseSettings):

@@ -313,6 +313,67 @@ class MilvusVectorStore:
         ranked = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
         return ranked[:top_k]
 
+    def _escape_milvus_str(self, s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    def query_chunks_by_s3_keys(self, s3_keys: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Load all indexed chunks for the given S3 keys and merge chunk_text in chunk_index order.
+        Returns map: s3_key -> {candidate_name, s3_bucket, skills, experience_years, education, email, merged_text}.
+        Keys with no rows in Milvus are omitted.
+        """
+        if not s3_keys:
+            return {}
+        self.connect()
+        quoted = ",".join(f'"{self._escape_milvus_str(k)}"' for k in s3_keys) # quoted = '"resumes/john_doe.pdf","resumes/jane_smith.pdf"'
+        expr = f"s3_key in [{quoted}]" # filter (like WHERE IN in SQL) s3_key in ["resumes/john_doe.pdf","resumes/jane_smith.pdf"]
+        output_fields = [
+            "s3_key",
+            "s3_bucket",
+            "candidate_name",
+            "skills",
+            "experience_years",
+            "education",
+            "email",
+            "chunk_index",
+            "chunk_text",
+        ]
+        rows = self._resume_collection.query( # get data from milvus based on metadata that matches the expression expr which is 
+            expr=expr,
+            output_fields=output_fields,
+            limit=16384,
+        )
+        by_key: Dict[str, List[Tuple[int, str]]] = {} # group chunks by resume key
+        meta_by_key: Dict[str, Dict[str, Any]] = {} # dictionary to store one metadata object per resume key
+        for row in rows:
+            sk = row.get("s3_key")
+            if not sk:
+                continue
+            idx = int(row.get("chunk_index") or 0)
+            text = row.get("chunk_text") or ""
+            by_key.setdefault(sk, []).append((idx, text)) # if key doesnt exists then always add it to the list
+            if sk not in meta_by_key: # if key doesnt exist in the metadata dictionary (First entry for a new resume) then add it to the dictionary
+                meta_by_key[sk] = {
+                    "s3_bucket": row.get("s3_bucket"),
+                    "candidate_name": row.get("candidate_name") or "Unknown",
+                    "skills": row.get("skills", ""),
+                    "experience_years": row.get("experience_years"),
+                    "education": row.get("education", ""),
+                    "email": row.get("email"),
+                } # add metadata object to the dictionary with key as resume key and value as metadata object
+                # after loop by_key stores the dictionary with resume as key and list of tuples (chunk_index, chunk_text) as value
+        out: Dict[str, Dict[str, Any]] = {}
+        for sk, parts in by_key.items(): # for each resume key, sort the chunks by chunk_index and merge the chunks into a single string
+            parts.sort(key=lambda x: x[0]) # sort the chunks by chunk_index
+            merged = "\n\n".join(p[1] for p in parts if p[1]) # merge the chunks into a single string
+            m = meta_by_key.get(sk, {})
+            out[sk] = {
+                **m,
+                "s3_key": sk,
+                "merged_text": merged,
+            } # add metadata object to the dictionary with key as resume key and value as metadata object
+        return out # final output is a dictionary with resume key as key and metadata object with merged_text included as value
+
     def get_resume_by_id(self, resume_id: str) -> Optional[dict]:
         self.connect()
         results = self._resume_collection.query(
@@ -344,6 +405,10 @@ class MilvusVectorStore:
     async def asearch_resumes(self, query_embedding: List[float], top_k: int = None) -> List[Dict]:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.search_resumes, query_embedding, top_k)
+
+    async def aquery_chunks_by_s3_keys(self, s3_keys: List[str]) -> Dict[str, Dict[str, Any]]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.query_chunks_by_s3_keys, s3_keys)
 
     async def aupsert_resume(self, resume_id, metadata, embeddings, chunks):
         loop = asyncio.get_event_loop()

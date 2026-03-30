@@ -32,12 +32,17 @@ async def run(args):
     print("⟳ Connecting to Milvus...")
     await loop.run_in_executor(None, vector_store.connect)
 
+    ref_keys = args.reference_key or None
+    resume_bucket = args.resume_bucket or None
+
     params = RankCandidatesInput(
         jd_text=args.jd_text or None,
         jd_s3_key=args.jd_key or None,
         jd_s3_bucket=args.bucket or None,
         top_k=args.top_k,
         use_cache=not args.no_cache,
+        reference_selected_resume_s3_keys=ref_keys,
+        resume_s3_bucket=resume_bucket,
     )
 
     print(f"⟳ Ranking candidates (top_k={args.top_k})...")
@@ -73,6 +78,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument(
+        "--reference-key",
+        action="append",
+        dest="reference_key",
+        default=None,
+        help="S3 key of an already-selected resume (LLM calibration); repeat for multiple",
+    )
+    parser.add_argument(
+        "--resume-bucket",
+        default=None,
+        help="S3 bucket for --reference-key (defaults to AWS_S3_RESUME_BUCKET)",
+    )
     parser.add_argument("--json", action="store_true", help="Print full JSON output")
     args = parser.parse_args()
 

@@ -73,8 +73,15 @@ You MAY include "weighted_score" but it WILL BE IGNORED — the server recompute
 Do not assign rank; the server will sort.
 """
 
-USER_PROMPT_TEMPLATE = """
-## Job Description
+REFERENCE_CALIBRATION_SUFFIX = """
+When a "Reference profiles" section is present in the user message:
+Those profiles are real candidates already selected for this job. Use them ONLY to calibrate
+seniority, skills depth, domain, and presentation style—what "good" looks like for this hire.
+Do NOT score reference profiles. Do NOT include them in your JSON output.
+Score ONLY the people listed under "Candidates to Rank".
+"""
+
+USER_PROMPT_JD_BODY = """## Job Description
 Title: {title}
 Company: {company}
 Required Skills: {required_skills}
@@ -84,7 +91,15 @@ Education Requirements: {education_reqs}
 
 ## Responsibilities
 {responsibilities}
+"""
 
+USER_PROMPT_REFERENCE_BLOCK = """
+## Reference profiles (already selected for this role)
+Use only to calibrate your scoring bar. Do not score these people; they must not appear in your JSON output.
+{reference_json}
+"""
+
+USER_PROMPT_CANDIDATES_BLOCK = """
 ## Candidates to Rank ({n_candidates} candidates)
 {candidates_json}
 
@@ -161,7 +176,84 @@ class CandidateRanker:
             self._client = _get_llm_client()
         return self._client
 
-    def _build_user_prompt(self, jd: JobDescription, candidates: List[dict]) -> str:
+    @staticmethod
+    def _system_content(has_references: bool) -> str:
+        if has_references:
+            return SYSTEM_PROMPT + "\n\n" + REFERENCE_CALIBRATION_SUFFIX
+        return SYSTEM_PROMPT
+
+    @staticmethod
+    def _budget_reference_profiles(refs: List[dict]) -> List[dict]:
+        """Apply per-reference and section-level character caps (mutates copies)."""
+        if not refs:
+            return []
+        per = settings.rag.llm_per_reference_resume_max_chars
+        section = settings.rag.llm_reference_section_max_chars
+        out = []
+        for r in refs:
+            text = (r.get("profile_text") or "").strip()
+            if not text:
+                continue
+            text = text[:per]
+            out.append({
+                "s3_key": r.get("s3_key", ""),
+                "candidate_name": r.get("candidate_name", "Unknown"),
+                "profile_text": text,
+            })
+        if section > 0:
+            total = sum(len(x["profile_text"]) for x in out)
+            if total > section and out:
+                per_alloc = max(section // len(out), 200)
+                for x in out:
+                    x["profile_text"] = x["profile_text"][:per_alloc]
+        return out
+
+    @staticmethod
+    def _shrink_until_fits(
+        jd_body: str,
+        jd_raw_block: str,
+        refs: List[dict],
+        n_candidates: int,
+        candidates_json: str,
+        cap: int,
+    ) -> str:
+        """Trim jd_raw then reference profile_text until the full user prompt fits `cap`."""
+
+        def assemble(jd_raw: str, ref_list: List[dict]) -> str:
+            ref_json = ""
+            if ref_list:
+                ref_json = USER_PROMPT_REFERENCE_BLOCK.format(
+                    reference_json=json.dumps(ref_list, indent=2),
+                )
+            cand_block = USER_PROMPT_CANDIDATES_BLOCK.format(
+                n_candidates=n_candidates,
+                candidates_json=candidates_json,
+            )
+            return jd_body + jd_raw + ref_json + cand_block
+
+        s = assemble(jd_raw_block, refs)
+        if len(s) <= cap:
+            return s
+        s = assemble("", refs) 
+        if len(s) <= cap:
+            return s
+        while len(s) > cap and refs:
+            longest = max(refs, key=lambda x: len(x.get("profile_text") or ""))
+            pt = longest.get("profile_text") or ""
+            if len(pt) <= 150:
+                break
+            longest["profile_text"] = pt[: int(len(pt) * 0.85)]
+            s = assemble("", refs)
+        if len(s) <= cap:
+            return s
+        return s[:cap]
+
+    def _build_user_prompt(
+        self,
+        jd: JobDescription,
+        candidates: List[dict],
+        reference_profiles: Optional[List[dict]] = None,
+    ) -> str:
         candidates_summary = []
         for i, c in enumerate(candidates, 1):
             excerpt = (c.get("best_chunk") or "")[:_CANDIDATE_EXCERPT_CHARS]
@@ -175,8 +267,15 @@ class CandidateRanker:
                 "vector_similarity_score": round(c.get("score", 0), 4),
                 "relevant_excerpt": excerpt,
             })
+        candidates_json = json.dumps(candidates_summary, indent=2)
 
-        return USER_PROMPT_TEMPLATE.format(
+        jd_raw_block = ""
+        raw_max = settings.rag.llm_jd_raw_max_chars
+        if raw_max > 0 and (jd.raw_text or "").strip():
+            snippet = jd.raw_text[:raw_max]
+            jd_raw_block = f"\n## Verbatim JD excerpt (truncated)\n{snippet}\n"
+
+        jd_body = USER_PROMPT_JD_BODY.format(
             title=jd.title,
             company=jd.company or "Not specified",
             required_skills=", ".join(jd.required_skills[:15]),
@@ -184,27 +283,64 @@ class CandidateRanker:
             min_experience=jd.min_experience_years,
             education_reqs=", ".join(jd.education_requirements[:4]) or "Not specified",
             responsibilities="\n".join(f"• {r}" for r in jd.responsibilities[:8]),
-            n_candidates=len(candidates),
-            candidates_json=json.dumps(candidates_summary, indent=2),
         )
+
+        refs = self._budget_reference_profiles(reference_profiles or [])
+        n_cand = len(candidates)
+        if refs:
+            user_prompt = jd_body + jd_raw_block
+            user_prompt += USER_PROMPT_REFERENCE_BLOCK.format(
+                reference_json=json.dumps(refs, indent=2),
+            )
+            user_prompt += USER_PROMPT_CANDIDATES_BLOCK.format(
+                n_candidates=n_cand,
+                candidates_json=candidates_json,
+            )
+        else:
+            user_prompt = jd_body + jd_raw_block
+            user_prompt += USER_PROMPT_CANDIDATES_BLOCK.format(
+                n_candidates=n_cand,
+                candidates_json=candidates_json,
+            )
+
+        total_cap = settings.rag.llm_user_prompt_max_chars
+        if total_cap > 0 and len(user_prompt) > total_cap:
+            user_prompt = self._shrink_until_fits(
+                jd_body,
+                jd_raw_block,
+                refs,
+                n_cand,
+                candidates_json,
+                total_cap,
+            )
+        est_tokens = max(len(user_prompt) // 4, 1)
+        logger.info("ranker.user_prompt_size", chars=len(user_prompt), est_tokens=est_tokens)
+        return user_prompt
 
     async def rerank_with_llm(
         self,
         jd: JobDescription,
         candidates: List[dict],
+        reference_profiles: Optional[List[dict]] = None,
     ) -> List[dict]:
         """Ask the LLM to score and re-rank candidates."""
         if not candidates:
             return []
 
-        user_prompt = self._build_user_prompt(jd, candidates)
-        logger.info("ranker.llm_rerank", model=settings.llm.model_name, n=len(candidates))
+        user_prompt = self._build_user_prompt(jd, candidates, reference_profiles)
+        has_refs = "## Reference profiles" in user_prompt
+        logger.info(
+            "ranker.llm_rerank",
+            model=settings.llm.model_name,
+            n=len(candidates),
+            references=has_refs,
+        )
 
         try:
             response = await self._client_().chat.completions.create(
                 model=settings.llm.model_name,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": self._system_content(has_refs)},
                     {"role": "user", "content": user_prompt},
                 ],
                 max_tokens=settings.llm.max_tokens,
@@ -282,12 +418,17 @@ class CandidateRanker:
         jd: JobDescription,
         retrieved_candidates: List[dict],
         final_k: int = None,
+        reference_profiles: Optional[List[dict]] = None,
     ) -> List[dict]:
         """Full two-stage ranking pipeline."""
         final_k = final_k or settings.rag.final_rank_k
 
         # Stage 2: LLM re-ranking
-        ranked = await self.rerank_with_llm(jd, retrieved_candidates)
+        ranked = await self.rerank_with_llm(
+            jd,
+            retrieved_candidates,
+            reference_profiles=reference_profiles,
+        )
 
         # Enrich results with original metadata fields if missing
         retrieval_map = {c["s3_key"]: c for c in retrieved_candidates}

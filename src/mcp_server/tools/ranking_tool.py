@@ -16,15 +16,16 @@ from __future__ import annotations
 
 import hashlib
 import time
-import uuid
 from typing import List, Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.config import get_logger, settings
 from src.llm.ranker import candidate_ranker
+from src.mcp_server.tools.resume_tool import _normalize_and_guard_resume_key
 from src.parsers.jd_parser import JobDescription, jd_parser
+from src.parsers.resume_parser import resume_parser
 from src.rag.cache import cache
 from src.rag.embeddings import embedder
 from src.rag.vector_store import vector_store
@@ -77,11 +78,40 @@ class RankCandidatesInput(BaseModel):
         True,
         description="If false, bypass cached ranking results and re-rank from scratch",
     )
+    reference_selected_resume_s3_keys: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Optional S3 keys of resumes already selected for this JD; used only as LLM "
+            "calibration context, not as the ranked pool."
+        ),
+    )
+    resume_s3_bucket: Optional[str] = Field(
+        None,
+        description="S3 bucket for reference resumes. Defaults to AWS_S3_RESUME_BUCKET",
+    )
+
+    @field_validator("reference_selected_resume_s3_keys", mode="before")
+    @classmethod
+    def _empty_reference_keys_to_none(cls, v: object) -> object:
+        if isinstance(v, list) and len(v) == 0:
+            return None
+        return v
 
     @model_validator(mode="after")
     def require_one_jd_source(self) -> "RankCandidatesInput":
         if not self.jd_text and not self.jd_s3_key:
             raise ValueError("Provide either jd_text or jd_s3_key")
+        return self
+
+    @model_validator(mode="after")
+    def limit_reference_resume_keys(self) -> "RankCandidatesInput":
+        if self.reference_selected_resume_s3_keys:
+            mx = settings.rag.max_reference_resume_keys
+            if len(self.reference_selected_resume_s3_keys) > mx:
+                raise ValueError(
+                    f"reference_selected_resume_s3_keys: at most {mx} keys allowed, "
+                    f"got {len(self.reference_selected_resume_s3_keys)}",
+                )
         return self
 
 
@@ -125,14 +155,27 @@ async def rank_candidates_for_job(params: RankCandidatesInput) -> RankCandidates
     Retrieve and LLM-rank the best candidates for a given job profile.
     """
     start = time.monotonic()
-    logger.info("tool.rank_candidates.start", jd_s3_key=params.jd_s3_key, top_k=params.top_k)
+    resume_bucket = params.resume_s3_bucket or settings.aws.s3_resume_bucket
+    ref_keys_norm = _normalize_reference_resume_keys(
+        params.reference_selected_resume_s3_keys,
+        resume_bucket,
+    )
+    ref_cache_arg = ref_keys_norm if ref_keys_norm else None
+    ref_key_set = frozenset(ref_keys_norm) if ref_keys_norm else frozenset()
+
+    logger.info(
+        "tool.rank_candidates.start",
+        jd_s3_key=params.jd_s3_key,
+        top_k=params.top_k,
+        n_reference_keys=len(ref_keys_norm),
+    )
 
     # ── Step 1: Resolve / parse the JD ───────────────────────────────────────
     jd = await _resolve_jd(params)
 
     # ── Step 2: Check ranking cache ───────────────────────────────────────────
     if params.use_cache:
-        cached_result = cache.get_ranking(jd.jd_id)
+        cached_result = cache.get_ranking(jd.jd_id, ref_cache_arg)
         if cached_result is not None:
             elapsed_ms = int((time.monotonic() - start) * 1000)
             logger.info("tool.rank_candidates.cache_hit", jd_id=jd.jd_id)
@@ -184,11 +227,40 @@ async def rank_candidates_for_job(params: RankCandidatesInput) -> RankCandidates
             message="No candidates found in the vector store for this job profile.",
         )
 
+    candidates_for_llm = (
+        [c for c in retrieved if c.get("s3_key") not in ref_key_set]
+        if ref_key_set
+        else retrieved
+    )
+
+    if not candidates_for_llm:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        return RankCandidatesOutput(
+            success=True,
+            jd_id=jd.jd_id,
+            jd_title=jd.title,
+            jd_company=jd.company,
+            total_retrieved=len(retrieved),
+            total_returned=0,
+            candidates=[],
+            processing_time_ms=elapsed_ms,
+            ranking_method="vector",
+            message=(
+                "All vector-retrieved candidates match reference-selected resume keys; "
+                "nothing left to rank for this request."
+            ),
+        )
+
+    reference_profiles: Optional[List[dict]] = None
+    if ref_keys_norm:
+        reference_profiles = await _load_reference_profiles(ref_keys_norm, resume_bucket)
+
     # ── Step 5: LLM re-ranking ────────────────────────────────────────────────
     ranked_raw = await candidate_ranker.rank_candidates(
         jd=jd,
-        retrieved_candidates=retrieved,
+        retrieved_candidates=candidates_for_llm,
         final_k=params.top_k,
+        reference_profiles=reference_profiles,
     )
 
     # ── Step 6: Build output (optionally enrich with presigned URLs) ──────────
@@ -242,7 +314,7 @@ async def rank_candidates_for_job(params: RankCandidatesInput) -> RankCandidates
     )
 
     # Cache the result
-    cache.set_ranking(jd.jd_id, output.model_dump())
+    cache.set_ranking(jd.jd_id, output.model_dump(), ref_cache_arg)
 
     logger.info(
         "tool.rank_candidates.done",
@@ -255,6 +327,71 @@ async def rank_candidates_for_job(params: RankCandidatesInput) -> RankCandidates
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _normalize_reference_resume_keys(
+    keys: Optional[List[str]],
+    bucket: str,
+) -> List[str]:
+    if not keys:
+        return []
+    return [_normalize_and_guard_resume_key(bucket, k) for k in keys]
+
+
+async def _load_reference_profiles(
+    normalized_keys: List[str],
+    bucket: str,
+) -> List[dict]:
+    """Merge Milvus chunks per key; S3 + parse fallback when not indexed."""
+    profiles: List[dict] = []
+    milvus_map = await vector_store.aquery_chunks_by_s3_keys(normalized_keys)
+
+    for key in normalized_keys:
+        row = milvus_map.get(key)
+        merged = (row or {}).get("merged_text") or ""
+        name = (row or {}).get("candidate_name") or "Unknown"
+
+        if merged.strip():
+            profiles.append({
+                "s3_key": key,
+                "candidate_name": name,
+                "profile_text": merged,
+            })
+            continue
+
+        try:
+            meta = await s3_client.head_object(bucket, key)
+            raw_bytes = await s3_client.download_bytes(bucket, key)
+            ext = s3_client.infer_file_extension(key)
+            rid = "ref_" + hashlib.sha256(
+                f"{meta.get('etag', '')}:{key}".encode(),
+            ).hexdigest()[:20] # generate a unique id for the reference resume
+            doc = resume_parser.parse(
+                data=raw_bytes,
+                extension=ext,
+                resume_id=rid,
+                s3_key=key,
+                s3_bucket=bucket,
+            )
+            text = doc.full_text if doc.sections else doc.raw_text
+            profiles.append({
+                "s3_key": key,
+                "candidate_name": doc.candidate_name,
+                "profile_text": text,
+            })
+        except Exception as exc:
+            logger.warning(
+                "tool.rank_candidates.reference_load_failed",
+                s3_key=key,
+                error=str(exc),
+            )
+            profiles.append({
+                "s3_key": key,
+                "candidate_name": name,
+                "profile_text": "",
+            })
+
+    return profiles
+
 
 async def _resolve_jd(params: RankCandidatesInput) -> JobDescription:
     """Parse JD from text or download from S3."""

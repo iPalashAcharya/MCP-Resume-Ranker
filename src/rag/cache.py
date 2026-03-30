@@ -6,7 +6,6 @@ Gracefully degrades when Redis is unavailable.
 from __future__ import annotations
 
 import hashlib
-import json
 import pickle
 from typing import Any, List, Optional
 
@@ -100,17 +99,31 @@ class CacheClient:
     # ── Ranking cache ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def _rank_key(jd_id: str) -> str:
-        return f"rank:{jd_id}"
+    def compose_rank_key(jd_id: str, reference_s3_keys: Optional[List[str]] = None) -> str:
+        """Stable cache key; when reference keys are set, include their hash (sorted)."""
+        if not reference_s3_keys:
+            return f"rank:{jd_id}"
+        h = hashlib.sha256("\n".join(sorted(reference_s3_keys)).encode()).hexdigest()[:32]
+        return f"rank:{jd_id}:ref:{h}"
 
-    def get_ranking(self, jd_id: str) -> Optional[list]:
-        return self.get(self._rank_key(jd_id))
+    def get_ranking(self, jd_id: str, reference_s3_keys: Optional[List[str]] = None) -> Optional[Any]:
+        return self.get(self.compose_rank_key(jd_id, reference_s3_keys))
 
-    def set_ranking(self, jd_id: str, result: list) -> None:
-        self.set(self._rank_key(jd_id), result, ttl=settings.redis.ttl_seconds)
+    def set_ranking(
+        self,
+        jd_id: str,
+        result: Any,
+        reference_s3_keys: Optional[List[str]] = None,
+    ) -> None:
+        self.set(
+            self.compose_rank_key(jd_id, reference_s3_keys),
+            result,
+            ttl=settings.redis.ttl_seconds,
+        )
 
     def invalidate_ranking(self, jd_id: str) -> None:
-        self.delete(self._rank_key(jd_id))
+        self.delete(f"rank:{jd_id}")
+        self.delete_pattern(f"rank:{jd_id}:*")
 
     def invalidate_all_rankings(self) -> int:
         return self.delete_pattern("rank:*")
