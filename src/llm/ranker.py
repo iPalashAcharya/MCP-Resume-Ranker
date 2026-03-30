@@ -24,9 +24,6 @@ from src.parsers.jd_parser import JobDescription
 
 logger = get_logger(__name__)
 
-# More context for role/title fit than a tiny chunk; still bounded for token limits.
-_CANDIDATE_EXCERPT_CHARS = 1000
-
 # Final score = formula minus red-flag penalty (see `_apply_deterministic_scoring`).
 _WEIGHT_SKILLS = 0.40
 _WEIGHT_EXPERIENCE = 0.30
@@ -40,15 +37,20 @@ _RED_FLAG_PENALTY_CAP = 15.0
 SYSTEM_PROMPT = """You are a strict technical recruiter scoring candidates against ONE job description.
 
 You receive a job title, required/preferred skills, minimum experience, education expectations,
-responsibilities, and for each candidate: skills, years of experience, education, vector similarity,
-and a text excerpt from their resume.
+responsibilities, and for each candidate: structured skills, experience_years, education, vector similarity,
+and resume text (merged chunks when available — may still be truncated).
+
+When experience_years is greater than zero or education is non-empty, treat those structured fields as
+ground truth from the applicant tracking system. Do NOT add red_flags like "lack of experience" or
+"insufficient education details" solely because the resume text snippet omits those sections — score
+experience_fit and education_fit using structured fields plus any supporting text.
 
 Scoring rules (use the FULL 0–100 range; avoid clustering everyone in the 80s–90s):
 - Typical strong-but-not-perfect matches: about 65–85 on relevant dimensions.
 - Reserve 90–100 for rare, near-perfect alignment on title/domain, skills, and experience together.
 - skills_match: overlap and depth vs JD **required** skills (not just keyword overlap).
 - experience_fit: compares candidate years to JD minimum; penalize if leadership/seniority in a **different domain** does not compensate for wrong track.
-- education_fit: meets or exceeds stated education requirements; use 70 if education is unknown from the excerpt.
+- education_fit: meets or exceeds stated education requirements; use 70 if education is unknown from structured fields and resume_text.
 - overall_relevance: holistic fit to THIS role — **job title and domain matter**. Examples:
   • If the JD is for a Web Application Technical Lead and the candidate’s primary leadership is
     Mobile (or another clearly different product/domain), overall_relevance must be **low** (about 25–55)
@@ -56,7 +58,7 @@ Scoring rules (use the FULL 0–100 range; avoid clustering everyone in the 80s�
   • Generic “strong engineer” without domain/title fit must not exceed about 75 on overall_relevance.
 
 red_flags:
-- List concrete issues (e.g. title/domain mismatch, missing critical required skills, thin evidence in excerpt).
+- List concrete issues (e.g. title/domain mismatch, missing critical required skills, thin evidence in resume_text).
 - If red_flags is non-empty, **overall_relevance must reflect that** (typically cap overall_relevance at about 60).
 
 Return ONLY JSON (no markdown). Use EITHER:
@@ -183,97 +185,64 @@ class CandidateRanker:
         return SYSTEM_PROMPT
 
     @staticmethod
-    def _budget_reference_profiles(refs: List[dict]) -> List[dict]:
+    def _budget_reference_profiles(
+        refs: List[dict],
+        *,
+        per_max: Optional[int] = None,
+        section_max: Optional[int] = None,
+    ) -> List[dict]:
         """Apply per-reference and section-level character caps (mutates copies)."""
         if not refs:
             return []
-        per = settings.rag.llm_per_reference_resume_max_chars
-        section = settings.rag.llm_reference_section_max_chars
+        per = (
+            settings.rag.llm_per_reference_resume_max_chars
+            if per_max is None
+            else per_max
+        )
+        section = (
+            settings.rag.llm_reference_section_max_chars
+            if section_max is None
+            else section_max
+        )
         out = []
         for r in refs:
             text = (r.get("profile_text") or "").strip()
             if not text:
                 continue
-            text = text[:per]
+            text = text[: max(per, 0)]
             out.append({
                 "s3_key": r.get("s3_key", ""),
                 "candidate_name": r.get("candidate_name", "Unknown"),
                 "profile_text": text,
             })
-        if section > 0:
+        if section > 0 and out:
             total = sum(len(x["profile_text"]) for x in out)
-            if total > section and out:
-                per_alloc = max(section // len(out), 200)
+            if total > section:
+                per_alloc = max(section // len(out), 150)
                 for x in out:
                     x["profile_text"] = x["profile_text"][:per_alloc]
         return out
-
-    @staticmethod
-    def _shrink_until_fits(
-        jd_body: str,
-        jd_raw_block: str,
-        refs: List[dict],
-        n_candidates: int,
-        candidates_json: str,
-        cap: int,
-    ) -> str:
-        """Trim jd_raw then reference profile_text until the full user prompt fits `cap`."""
-
-        def assemble(jd_raw: str, ref_list: List[dict]) -> str:
-            ref_json = ""
-            if ref_list:
-                ref_json = USER_PROMPT_REFERENCE_BLOCK.format(
-                    reference_json=json.dumps(ref_list, indent=2),
-                )
-            cand_block = USER_PROMPT_CANDIDATES_BLOCK.format(
-                n_candidates=n_candidates,
-                candidates_json=candidates_json,
-            )
-            return jd_body + jd_raw + ref_json + cand_block
-
-        s = assemble(jd_raw_block, refs)
-        if len(s) <= cap:
-            return s
-        s = assemble("", refs) 
-        if len(s) <= cap:
-            return s
-        while len(s) > cap and refs:
-            longest = max(refs, key=lambda x: len(x.get("profile_text") or ""))
-            pt = longest.get("profile_text") or ""
-            if len(pt) <= 150:
-                break
-            longest["profile_text"] = pt[: int(len(pt) * 0.85)]
-            s = assemble("", refs)
-        if len(s) <= cap:
-            return s
-        return s[:cap]
 
     def _build_user_prompt(
         self,
         jd: JobDescription,
         candidates: List[dict],
         reference_profiles: Optional[List[dict]] = None,
+        max_user_override: Optional[int] = None,
     ) -> str:
-        candidates_summary = []
-        for i, c in enumerate(candidates, 1):
-            excerpt = (c.get("best_chunk") or "")[:_CANDIDATE_EXCERPT_CHARS]
-            candidates_summary.append({
-                "index": i,
-                "s3_key": c.get("s3_key", ""),
-                "candidate_name": c.get("candidate_name", "Unknown"),
-                "skills": c.get("skills", []),
-                "experience_years": c.get("experience_years", 0),
-                "education": c.get("education", []),
-                "vector_similarity_score": round(c.get("score", 0), 4),
-                "relevant_excerpt": excerpt,
-            })
-        candidates_json = json.dumps(candidates_summary, indent=2)
+        max_user = (
+            max_user_override
+            if max_user_override is not None
+            else settings.rag.llm_user_prompt_max_chars
+        )
+        if max_user <= 0:
+            max_user = 26000
 
-        jd_raw_block = ""
+        jd_raw_full = ""
         raw_max = settings.rag.llm_jd_raw_max_chars
         if raw_max > 0 and (jd.raw_text or "").strip():
             snippet = jd.raw_text[:raw_max]
-            jd_raw_block = f"\n## Verbatim JD excerpt (truncated)\n{snippet}\n"
+            jd_raw_full = f"\n## Verbatim JD excerpt (truncated)\n{snippet}\n"
 
         jd_body = USER_PROMPT_JD_BODY.format(
             title=jd.title,
@@ -285,36 +254,94 @@ class CandidateRanker:
             responsibilities="\n".join(f"• {r}" for r in jd.responsibilities[:8]),
         )
 
-        refs = self._budget_reference_profiles(reference_profiles or [])
+        ref_in = reference_profiles or []
         n_cand = len(candidates)
-        if refs:
-            user_prompt = jd_body + jd_raw_block
-            user_prompt += USER_PROMPT_REFERENCE_BLOCK.format(
-                reference_json=json.dumps(refs, indent=2),
+
+        per_body = settings.rag.llm_candidate_context_max_chars
+        if per_body <= 0:
+            per_body = 2200
+        per_body = max(per_body, 400)
+
+        per_ref = max(settings.rag.llm_per_reference_resume_max_chars, 300)
+        sec_ref = settings.rag.llm_reference_section_max_chars
+
+        include_jd_raw = bool(jd_raw_full)
+        user_prompt = ""
+
+        def pack(jd_raw_use: str, p_body: int, p_ref: int, s_ref: int) -> str:
+            refs = self._budget_reference_profiles(
+                ref_in, per_max=p_ref, section_max=s_ref,
             )
-            user_prompt += USER_PROMPT_CANDIDATES_BLOCK.format(
-                n_candidates=n_cand,
-                candidates_json=candidates_json,
-            )
-        else:
-            user_prompt = jd_body + jd_raw_block
-            user_prompt += USER_PROMPT_CANDIDATES_BLOCK.format(
-                n_candidates=n_cand,
-                candidates_json=candidates_json,
+            summaries = []
+            for i, c in enumerate(candidates, 1):
+                body = (c.get("merged_chunk_text") or c.get("best_chunk") or "").strip()
+                body = body[:p_body]
+                summaries.append({
+                    "index": i,
+                    "s3_key": c.get("s3_key", ""),
+                    "candidate_name": c.get("candidate_name", "Unknown"),
+                    "skills": c.get("skills", []),
+                    "experience_years": c.get("experience_years", 0),
+                    "education": c.get("education", []),
+                    "vector_similarity_score": round(c.get("score", 0), 4),
+                    "resume_text": body,
+                })
+            cj = json.dumps(summaries, indent=2)
+            if refs:
+                return (
+                    jd_body
+                    + jd_raw_use
+                    + USER_PROMPT_REFERENCE_BLOCK.format(
+                        reference_json=json.dumps(refs, indent=2),
+                    )
+                    + USER_PROMPT_CANDIDATES_BLOCK.format(
+                        n_candidates=n_cand,
+                        candidates_json=cj,
+                    )
+                )
+            return (
+                jd_body
+                + jd_raw_use
+                + USER_PROMPT_CANDIDATES_BLOCK.format(
+                    n_candidates=n_cand,
+                    candidates_json=cj,
+                )
             )
 
-        total_cap = settings.rag.llm_user_prompt_max_chars
-        if total_cap > 0 and len(user_prompt) > total_cap:
-            user_prompt = self._shrink_until_fits(
-                jd_body,
-                jd_raw_block,
-                refs,
-                n_cand,
-                candidates_json,
-                total_cap,
+        for iteration in range(28):
+            jd_raw_use = jd_raw_full if include_jd_raw else ""
+            user_prompt = pack(jd_raw_use, per_body, per_ref, sec_ref)
+            if len(user_prompt) <= max_user:
+                break
+            if per_body > 500:
+                per_body = int(per_body * 0.84)
+            elif per_ref > 350:
+                per_ref = int(per_ref * 0.84)
+            elif sec_ref > 800:
+                sec_ref = int(sec_ref * 0.84)
+            elif include_jd_raw:
+                include_jd_raw = False
+            else:
+                per_body = max(400, int(per_body * 0.9))
+                per_ref = max(300, int(per_ref * 0.9))
+
+        if len(user_prompt) > max_user:
+            user_prompt = pack("", 400, 300, min(sec_ref, 4000) if sec_ref > 0 else 0)
+
+        if len(user_prompt) > max_user:
+            logger.warning(
+                "ranker.prompt_still_over_budget",
+                chars=len(user_prompt),
+                max_user=max_user,
             )
+
         est_tokens = max(len(user_prompt) // 4, 1)
-        logger.info("ranker.user_prompt_size", chars=len(user_prompt), est_tokens=est_tokens)
+        logger.info(
+            "ranker.user_prompt_size",
+            chars=len(user_prompt),
+            est_tokens=est_tokens,
+            max_user=max_user,
+        )
         return user_prompt
 
     async def rerank_with_llm(
@@ -336,18 +363,42 @@ class CandidateRanker:
             references=has_refs,
         )
 
-        try:
-            response = await self._client_().chat.completions.create(
+        async def _call_llm(umax: Optional[int] = None) -> Any:
+            up = (
+                user_prompt
+                if umax is None
+                else self._build_user_prompt(
+                    jd, candidates, reference_profiles, max_user_override=umax,
+                )
+            )
+            hr = "## Reference profiles" in up
+            return await self._client_().chat.completions.create(
                 model=settings.llm.model_name,
                 messages=[
-                    {"role": "system", "content": self._system_content(has_refs)},
-                    {"role": "user", "content": user_prompt},
+                    {"role": "system", "content": self._system_content(hr)},
+                    {"role": "user", "content": up},
                 ],
                 max_tokens=settings.llm.max_tokens,
                 temperature=settings.llm.temperature,
                 response_format={"type": "json_object"} if _supports_json_mode() else None,
             )
 
+        try:
+            response = await _call_llm()
+        except Exception as exc:
+            err_s = str(exc).lower()
+            if "413" in str(exc) or "request too large" in err_s or "tokens per minute" in err_s:
+                logger.warning("ranker.llm_oversized_retry", error=str(exc)[:200])
+                try:
+                    response = await _call_llm(umax=20000)
+                except Exception as exc2:
+                    logger.error("ranker.llm_error", error=str(exc2), fallback="vector_score")
+                    return self._fallback_rank(candidates)
+            else:
+                logger.error("ranker.llm_error", error=str(exc), fallback="vector_score")
+                return self._fallback_rank(candidates)
+
+        try:
             content = response.choices[0].message.content or "[]"
             ranked = self._parse_llm_response(content, candidates)
 
@@ -355,8 +406,7 @@ class CandidateRanker:
             return ranked
 
         except Exception as exc:
-            logger.error("ranker.llm_error", error=str(exc), fallback="vector_score")
-            # Graceful fallback: return candidates sorted by vector score
+            logger.error("ranker.llm_parse_or_rank_error", error=str(exc), fallback="vector_score")
             return self._fallback_rank(candidates)
 
     def _parse_llm_response(self, content: str, fallback_candidates: List[dict]) -> List[dict]:
@@ -444,9 +494,14 @@ class CandidateRanker:
 
 
 def _supports_json_mode() -> bool:
-    """Return True for providers known to support json_object response format."""
+    """Return True for providers/models known to support OpenAI-style json_object responses."""
     model = settings.llm.model_name.lower()
-    return any(p in model for p in ("gpt-4", "gpt-3.5", "qwen"))
+    prov = settings.llm.provider.value
+    if any(p in model for p in ("gpt-4", "gpt-3.5", "qwen")):
+        return True
+    if prov == "groq" and any(p in model for p in ("llama", "mixtral", "gemma")):
+        return True
+    return False
 
 
 # Module-level singleton

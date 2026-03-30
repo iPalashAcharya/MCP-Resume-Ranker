@@ -130,20 +130,28 @@ class RAGSettings(BaseSettings):
     chunk_size: int = Field(512)
     chunk_overlap: int = Field(64)
     llm_jd_raw_max_chars: int = Field(
-        4000,
+        2500,
         description="Append verbatim JD excerpt to LLM user prompt; 0 disables.",
     )
     llm_per_reference_resume_max_chars: int = Field(
-        4000,
+        2200,
         description="Max chars per reference profile (already-selected resumes) in the LLM prompt.",
     )
     llm_reference_section_max_chars: int = Field(
-        60000,
+        10000,
         description="Soft cap on total chars across all reference profiles; 0 means no section-level cap.",
     )
     llm_user_prompt_max_chars: int = Field(
-        0,
-        description="If > 0, trim JD raw + reference text until the user prompt fits this size.",
+        26000,
+        description="Hard cap on user-message chars; ranker shrinks per-candidate/reference text to fit (Groq TPM).",
+    )
+    llm_candidate_context_max_chars: int = Field(
+        2200,
+        description="Initial max chars of merged resume text per candidate; ranker may shrink further to fit llm_user_prompt_max_chars.",
+    )
+    junk_candidate_names_csv: str = Field(
+        "role overview,abstract,position overview,job overview,table of contents,executive summary",
+        description="Comma-separated lowercase names to drop from retrieval (mis-ingested JD/snippet rows).",
     )
     max_reference_resume_keys: int = Field(
         30,

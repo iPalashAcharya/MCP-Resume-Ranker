@@ -209,8 +209,13 @@ async def rank_candidates_for_job(params: RankCandidatesInput) -> RankCandidates
 
     # Apply hard skill / experience filters post-retrieval
     retrieved = _apply_hard_filters(retrieved, params)
+    retrieved, junk_dropped = _filter_junk_candidate_rows(retrieved)
 
-    logger.info("tool.rank_candidates.retrieved", count=len(retrieved))
+    logger.info(
+        "tool.rank_candidates.retrieved",
+        count=len(retrieved),
+        junk_filtered=junk_dropped,
+    )
 
     if not retrieved:
         elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -255,6 +260,8 @@ async def rank_candidates_for_job(params: RankCandidatesInput) -> RankCandidates
     if ref_keys_norm:
         reference_profiles = await _load_reference_profiles(ref_keys_norm, resume_bucket)
 
+    candidates_for_llm = await _enrich_candidates_with_merged_chunks(candidates_for_llm)
+
     # ── Step 5: LLM re-ranking ────────────────────────────────────────────────
     ranked_raw = await candidate_ranker.rank_candidates(
         jd=jd,
@@ -298,7 +305,10 @@ async def rank_candidates_for_job(params: RankCandidatesInput) -> RankCandidates
         )
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
-    ranking_method = "llm+vector" if ranked_raw and "skills_match" in ranked_raw[0] else "vector_fallback"
+    used_llm_scores = bool(
+        ranked_raw and ranked_raw[0].get("skills_match") is not None
+    )
+    ranking_method = "llm+vector" if used_llm_scores else "vector_fallback"
 
     output = RankCandidatesOutput(
         success=True,
@@ -310,7 +320,7 @@ async def rank_candidates_for_job(params: RankCandidatesInput) -> RankCandidates
         candidates=candidates,
         processing_time_ms=elapsed_ms,
         ranking_method=ranking_method,
-        message=f"Ranked {len(candidates)} candidates for '{jd.title}' in {elapsed_ms}ms",
+        message=_ranking_message(jd.title, elapsed_ms, len(candidates), used_llm_scores),
     )
 
     # Cache the result
@@ -328,6 +338,16 @@ async def rank_candidates_for_job(params: RankCandidatesInput) -> RankCandidates
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
+def _ranking_message(title: str, elapsed_ms: int, n: int, used_llm: bool) -> str:
+    base = f"Ranked {n} candidates for '{title}' in {elapsed_ms}ms"
+    if not used_llm:
+        return (
+            base
+            + " (vector similarity only — LLM re-rank was skipped or failed; check logs)"
+        )
+    return base
+
+
 def _normalize_reference_resume_keys(
     keys: Optional[List[str]],
     bucket: str,
@@ -335,6 +355,61 @@ def _normalize_reference_resume_keys(
     if not keys:
         return []
     return [_normalize_and_guard_resume_key(bucket, k) for k in keys]
+
+
+def _junk_candidate_name_blocklist() -> set[str]:
+    raw = (settings.rag.junk_candidate_names_csv or "").strip()
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+
+def _filter_junk_candidate_rows(candidates: List[dict]) -> tuple[List[dict], int]:
+    """Remove rows whose candidate_name looks like JD fragments / mis-ingested docs."""
+    block = _junk_candidate_name_blocklist()
+    if not block:
+        return candidates, 0
+    kept: List[dict] = []
+    dropped = 0
+    for c in candidates:
+        name = (c.get("candidate_name") or "").strip().lower()
+        if name in block:
+            dropped += 1
+            logger.info(
+                "tool.rank_candidates.drop_junk_candidate",
+                candidate_name=c.get("candidate_name"),
+                s3_key=c.get("s3_key"),
+            )
+            continue
+        kept.append(c)
+    return kept, dropped
+
+
+async def _enrich_candidates_with_merged_chunks(candidates: List[dict]) -> List[dict]:
+    """
+    Attach merged_chunk_text (all Milvus chunks per s3_key, ordered) so the LLM sees
+    more than the single best vector hit chunk.
+    """
+    if not candidates:
+        return candidates
+    ordered_keys: List[str] = []
+    seen: set[str] = set()
+    for c in candidates:
+        k = c.get("s3_key")
+        if k and k not in seen:
+            seen.add(k)
+            ordered_keys.append(k)
+    if not ordered_keys:
+        return candidates
+    milvus_map = await vector_store.aquery_chunks_by_s3_keys(ordered_keys)
+    enriched: List[dict] = []
+    for c in candidates:
+        k = c.get("s3_key")
+        row = milvus_map.get(k) if k else None
+        merged = (row or {}).get("merged_text") or ""
+        nc = dict(c)
+        if merged.strip():
+            nc["merged_chunk_text"] = merged
+        enriched.append(nc)
+    return enriched
 
 
 async def _load_reference_profiles(
