@@ -423,24 +423,24 @@ async def _enrich_candidates_with_merged_chunks(
         row = milvus_map.get(k) if k else None
         merged = (row or {}).get("merged_text") or ""
         chunk_rows = (row or {}).get("chunk_rows") or []
-        nc = dict(c)
+        new_candidate = dict(c)
         if merged.strip():
-            nc["merged_chunk_text"] = merged
+            new_candidate["merged_chunk_text"] = merged
         if row:
-            nc["project_skills"] = _normalize_skill_list(row.get("project_skills"))
+            new_candidate["project_skills"] = _normalize_skill_list(row.get("project_skills"))
 
-        base = float(nc.get("score", 0))
-        nc["vector_score_pre_boost"] = base
+        base = float(new_candidate.get("score", 0))
+        new_candidate["vector_score_pre_boost"] = base
         analysis = compute_candidate_skill_boost(jd, chunk_rows if isinstance(chunk_rows, list) else [])
         mult = float(analysis.get("skill_boost_multiplier", 1.0))
-        nc["skill_boost_multiplier"] = mult
-        nc["skills_in_projects"] = analysis.get("skills_in_projects", [])
-        nc["skills_not_in_projects"] = analysis.get("skills_not_in_projects", [])
-        nc["skills_projects_overlap_ratio"] = analysis.get("skills_projects_overlap_ratio", 0.0)
-        nc["jd_project_signals_match_ratio"] = analysis.get("jd_project_signals_match_ratio", 0.0)
-        nc["score"] = base * mult
+        new_candidate["skill_boost_multiplier"] = mult
+        new_candidate["skills_in_projects"] = analysis.get("skills_in_projects", [])
+        new_candidate["skills_not_in_projects"] = analysis.get("skills_not_in_projects", [])
+        new_candidate["skills_projects_overlap_ratio"] = analysis.get("skills_projects_overlap_ratio", 0.0)
+        new_candidate["jd_project_signals_match_ratio"] = analysis.get("jd_project_signals_match_ratio", 0.0)
+        new_candidate["score"] = base * mult
 
-        enriched.append(nc)
+        enriched.append(new_candidate)
 
     enriched.sort(key=lambda x: float(x.get("score", 0)), reverse=True)
     return enriched
