@@ -27,6 +27,7 @@ from src.mcp_server.tools.resume_tool import _normalize_and_guard_resume_key
 from src.parsers.jd_parser import JobDescription, jd_parser
 from src.parsers.resume_parser import resume_parser
 from src.rag.cache import cache
+from src.rag.ranking_skill_boost import compute_candidate_skill_boost
 from src.rag.embeddings import embedder
 from src.rag.vector_store import vector_store
 from src.s3.client import s3_client
@@ -122,6 +123,10 @@ class CandidateResult(BaseModel):
     s3_bucket: Optional[str]
     email: Optional[str]
     skills: List[str]
+    project_skills: List[str] = Field(
+        default_factory=list,
+        description="Tech stack evidenced in project/portfolio sections (weighted higher than generic skills)",
+    )
     experience_years: Optional[float]
     education: List[str]
     weighted_score: float
@@ -260,7 +265,7 @@ async def rank_candidates_for_job(params: RankCandidatesInput) -> RankCandidates
     if ref_keys_norm:
         reference_profiles = await _load_reference_profiles(ref_keys_norm, resume_bucket)
 
-    candidates_for_llm = await _enrich_candidates_with_merged_chunks(candidates_for_llm)
+    candidates_for_llm = await _enrich_candidates_with_merged_chunks(candidates_for_llm, jd)
 
     # ── Step 5: LLM re-ranking ────────────────────────────────────────────────
     ranked_raw = await candidate_ranker.rank_candidates(
@@ -289,6 +294,7 @@ async def rank_candidates_for_job(params: RankCandidatesInput) -> RankCandidates
                 email=r.get("email"),
                 skills=r.get("skills", []) if isinstance(r.get("skills"), list)
                         else str(r.get("skills", "")).split(","),
+                project_skills=_normalize_skill_list(r.get("project_skills")),
                 experience_years=r.get("experience_years"),
                 education=r.get("education", []) if isinstance(r.get("education"), list)
                            else str(r.get("education", "")).split(" | "),
@@ -338,6 +344,14 @@ async def rank_candidates_for_job(params: RankCandidatesInput) -> RankCandidates
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
+def _normalize_skill_list(raw: object) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    return [x.strip() for x in str(raw).split(",") if x.strip()]
+
+
 def _ranking_message(title: str, elapsed_ms: int, n: int, used_llm: bool) -> str:
     base = f"Ranked {n} candidates for '{title}' in {elapsed_ms}ms"
     if not used_llm:
@@ -383,10 +397,13 @@ def _filter_junk_candidate_rows(candidates: List[dict]) -> tuple[List[dict], int
     return kept, dropped
 
 
-async def _enrich_candidates_with_merged_chunks(candidates: List[dict]) -> List[dict]:
+async def _enrich_candidates_with_merged_chunks(
+    candidates: List[dict],
+    jd: JobDescription,
+) -> List[dict]:
     """
-    Attach merged_chunk_text (all Milvus chunks per s3_key, ordered) so the LLM sees
-    more than the single best vector hit chunk.
+    Load Milvus rows per candidate once: merge chunk text for the LLM, attach chunk_rows,
+    and apply skill-based boosts on top of the vector similarity score (multiplicative).
     """
     if not candidates:
         return candidates
@@ -405,10 +422,27 @@ async def _enrich_candidates_with_merged_chunks(candidates: List[dict]) -> List[
         k = c.get("s3_key")
         row = milvus_map.get(k) if k else None
         merged = (row or {}).get("merged_text") or ""
+        chunk_rows = (row or {}).get("chunk_rows") or []
         nc = dict(c)
         if merged.strip():
             nc["merged_chunk_text"] = merged
+        if row:
+            nc["project_skills"] = _normalize_skill_list(row.get("project_skills"))
+
+        base = float(nc.get("score", 0))
+        nc["vector_score_pre_boost"] = base
+        analysis = compute_candidate_skill_boost(jd, chunk_rows if isinstance(chunk_rows, list) else [])
+        mult = float(analysis.get("skill_boost_multiplier", 1.0))
+        nc["skill_boost_multiplier"] = mult
+        nc["skills_in_projects"] = analysis.get("skills_in_projects", [])
+        nc["skills_not_in_projects"] = analysis.get("skills_not_in_projects", [])
+        nc["skills_projects_overlap_ratio"] = analysis.get("skills_projects_overlap_ratio", 0.0)
+        nc["jd_project_signals_match_ratio"] = analysis.get("jd_project_signals_match_ratio", 0.0)
+        nc["score"] = base * mult
+
         enriched.append(nc)
+
+    enriched.sort(key=lambda x: float(x.get("score", 0)), reverse=True)
     return enriched
 
 
@@ -539,7 +573,9 @@ def _apply_hard_filters(candidates: List[dict], params: RankCandidatesInput) -> 
     required = {s.lower() for s in params.required_skills_filter}
     filtered = []
     for c in candidates:
-        candidate_skills = {s.lower() for s in c.get("skills", [])}
+        listed = _normalize_skill_list(c.get("skills"))
+        from_projects = _normalize_skill_list(c.get("project_skills"))
+        candidate_skills = {s.lower() for s in listed + from_projects}
         if required.issubset(candidate_skills):
             filtered.append(c)
 

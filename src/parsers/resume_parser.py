@@ -2,17 +2,25 @@
 parsers/resume_parser.py — Extract structured information from resumes.
 Supports PDF, DOCX, DOC, and plain-text formats.
 Returns a ResumeDocument dataclass for downstream embedding.
+
+Project/portfolio *sections* are detected via _PROJECT_SECTION_HEADER_RE. At ingest, the chunker
+adds heuristic per-chunk `skill_signals` for Projects rows (see `src.rag.skill_signals`).
+`ResumeDocument.project_skills` is populated from those signals when indexing (not here).
+Document-level `skills` uses a light keyword pass on the full resume for quick metadata.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from src.config import get_logger
 
 logger = get_logger(__name__)
+
+# Milvus VARCHAR for skills / project_skills — stay under max_length with comma joining.
+_METADATA_SKILLS_MAX_CHARS = 1000
+_SECTION_HEADER_MAX_CHARS = 72
 
 
 # ─── Data Models ─────────────────────────────────────────────────────────────
@@ -34,6 +42,7 @@ class ResumeDocument:
     raw_text: str
     sections: List[ResumeSection] = field(default_factory=list)
     skills: List[str] = field(default_factory=list)
+    project_skills: List[str] = field(default_factory=list)
     experience_years: float = 0.0
     education: List[str] = field(default_factory=list)
     email: Optional[str] = None
@@ -55,7 +64,8 @@ class ResumeDocument:
             "s3_key": self.s3_key,
             "s3_bucket": self.s3_bucket,
             "candidate_name": self.candidate_name,
-            "skills": ",".join(self.skills),
+            "skills": _comma_join_limited(self.skills, _METADATA_SKILLS_MAX_CHARS),
+            "project_skills": _comma_join_limited(self.project_skills, _METADATA_SKILLS_MAX_CHARS),
             "experience_years": self.experience_years,
             "education": " | ".join(self.education),
             "email": self.email or "",
@@ -64,19 +74,33 @@ class ResumeDocument:
 
 
 # ─── Section Patterns ─────────────────────────────────────────────────────────
+# Project / portfolio blocks use _PROJECT_SECTION_HEADER_RE (checked first) so lines like
+# "Selected Projects" match — not only lines that *start* with "Projects".
 
-_SECTION_PATTERNS = [
+_PROJECTS_SECTION_IMPORTANCE = 1.3
+
+_SECTION_PATTERNS: List[Tuple[str, str, float]] = [
     (r"(?i)(summary|objective|profile|about me)", "summary", 1.5),
     (r"(?i)(experience|work history|employment|career)", "experience", 2.0),
     (r"(?i)(education|academic|qualification)", "education", 1.5),
     (r"(?i)(skills?|technical skills?|core competencies|technologies)", "skills", 2.0),
-    (r"(?i)(projects?|portfolio)", "projects", 1.3),
     (r"(?i)(certifications?|licenses?|accreditations?)", "certifications", 1.2),
     (r"(?i)(awards?|achievements?|honors?)", "achievements", 1.0),
     (r"(?i)(publications?|research|papers?)", "publications", 1.0),
     (r"(?i)(languages?|spoken languages?)", "languages", 0.8),
     (r"(?i)(volunteer|community|social)", "volunteer", 0.7),
 ]
+
+# Header line: optional bullets/numbering, optional qualifier, then projects/portfolio anchor (not mid-sentence).
+_PROJECT_SECTION_HEADER_RE = re.compile(
+    r"(?i)^[\s\-–—•·\t\u2022\u25cf\u25aa\(\[\{]*(?:\d+[\.)]\s*)?"
+    r"(?:"
+    r"(?:selected|key|personal|academic|technical|notable|side|relevant|related|major|capstone|"
+    r"course|professional|independent|research|open\s*source|github)\s+"
+    r")?"
+    r"(?:projects?|portfolio|project\s+work|project\s+experience|(?:my|our|the)\s+portfolio)\b"
+    r"\s*[:\-–—]?\s*$"
+)
 
 _SKILL_KEYWORDS = re.compile(
     r"\b(Python|Java|JavaScript|TypeScript|C\+\+|C#|Go|Rust|Swift|Kotlin|"
@@ -89,9 +113,115 @@ _SKILL_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Canonical display names for regex matches (stable Milvus / API values).
+_SKILL_DISPLAY_BY_LOWER = {
+    "python": "Python",
+    "java": "Java",
+    "javascript": "JavaScript",
+    "typescript": "TypeScript",
+    "c++": "C++",
+    "c#": "C#",
+    "go": "Go",
+    "rust": "Rust",
+    "swift": "Swift",
+    "kotlin": "Kotlin",
+    "react": "React",
+    "angular": "Angular",
+    "vue": "Vue",
+    "node.js": "Node.js",
+    "fastapi": "FastAPI",
+    "django": "Django",
+    "flask": "Flask",
+    "spring": "Spring",
+    "rails": "Rails",
+    "aws": "AWS",
+    "gcp": "GCP",
+    "azure": "Azure",
+    "docker": "Docker",
+    "kubernetes": "Kubernetes",
+    "terraform": "Terraform",
+    "ci/cd": "CI/CD",
+    "sql": "SQL",
+    "postgresql": "PostgreSQL",
+    "mysql": "MySQL",
+    "mongodb": "MongoDB",
+    "redis": "Redis",
+    "elasticsearch": "Elasticsearch",
+    "milvus": "Milvus",
+    "machine learning": "Machine Learning",
+    "deep learning": "Deep Learning",
+    "nlp": "NLP",
+    "llm": "LLM",
+    "rag": "RAG",
+    "tensorflow": "TensorFlow",
+    "pytorch": "PyTorch",
+    "huggingface": "HuggingFace",
+    "langchain": "LangChain",
+    "openai": "OpenAI",
+    "rest": "REST",
+    "graphql": "GraphQL",
+    "grpc": "gRPC",
+    "microservices": "Microservices",
+    "kafka": "Kafka",
+    "rabbitmq": "RabbitMQ",
+}
+
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 _PHONE_RE = re.compile(r"[\+\(]?[0-9][0-9\s\-\(\)\.]{7,}[0-9]")
 _YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+
+
+def _comma_join_limited(tokens: List[str], max_len: int) -> str:
+    """Join skill lists for Milvus VARCHAR without exceeding a safe byte budget."""
+    if max_len <= 0 or not tokens:
+        return ""
+    parts: List[str] = []
+    total = 0
+    for raw in tokens:
+        string = str(raw).strip()
+        if not string:
+            continue
+        separator = 1 if parts else 0
+        if total + separator + len(string) > max_len:
+            break
+        parts.append(string)
+        total += separator + len(string)
+    return ",".join(parts)
+
+
+def _is_project_section_header(line: str) -> bool:
+    stripped = line.strip()
+    if len(stripped) >= _SECTION_HEADER_MAX_CHARS:
+        return False
+    return bool(_PROJECT_SECTION_HEADER_RE.match(stripped))
+
+
+def _match_section_header(stripped: str) -> Optional[Tuple[str, float]]:
+    """Map a short standalone line to (section_title, importance), or None."""
+    if len(stripped) >= _SECTION_HEADER_MAX_CHARS:
+        return None
+    if _is_project_section_header(stripped):
+        return ("projects", _PROJECTS_SECTION_IMPORTANCE)
+    for pattern, name, importance in _SECTION_PATTERNS:
+        if re.match(pattern, stripped):
+            return (name, importance)
+    return None
+
+
+def _normalize_extracted_skills(found: set[str]) -> List[str]:
+    """Stable ordering and canonical casing for storage and comparison."""
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for raw in sorted(found, key=lambda x: x.lower()):
+        t = raw.strip()
+        if not t:
+            continue
+        key = re.sub(r"\s+", " ", t.lower())
+        canon = _SKILL_DISPLAY_BY_LOWER.get(key, t)
+        if canon not in seen:
+            seen.add(canon)
+            ordered.append(canon)
+    return ordered
 
 
 # ─── Text Extractors ─────────────────────────────────────────────────────────
@@ -149,7 +279,7 @@ def _extract_text_from_bytes(data: bytes, extension: str) -> str:
 # ─── Analysis helpers ─────────────────────────────────────────────────────────
 
 def _extract_sections(text: str) -> List[ResumeSection]:
-    lines = text.splitlines()
+    lines = text.splitlines() #split into list of lines at line break
     sections: List[ResumeSection] = []
     current_title = "General"
     current_content: List[str] = []
@@ -161,11 +291,7 @@ def _extract_sections(text: str) -> List[ResumeSection]:
             current_content.append("")
             continue
 
-        matched_section = None
-        for pattern, name, importance in _SECTION_PATTERNS:
-            if re.match(pattern, stripped) and len(stripped) < 60:
-                matched_section = (name, importance)
-                break
+        matched_section = _match_section_header(stripped)
 
         if matched_section:
             if current_content:
@@ -194,8 +320,10 @@ def _extract_sections(text: str) -> List[ResumeSection]:
 
 
 def _extract_skills(text: str) -> List[str]:
+    if not (text or "").strip():
+        return []
     found = set(_SKILL_KEYWORDS.findall(text))
-    return sorted(found)
+    return _normalize_extracted_skills(found)
 
 
 def _estimate_experience_years(text: str) -> float:
@@ -259,6 +387,7 @@ class ResumeParser:
             raw_text=raw_text,
             sections=sections,
             skills=skills,
+            project_skills=[],
             experience_years=experience_years,
             education=education,
             email=email_match.group() if email_match else None,

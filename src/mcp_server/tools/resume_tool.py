@@ -6,9 +6,9 @@ Pipeline:
   1. Validate the S3 object (format, size)
   2. Download bytes from S3
   3. Parse text + structure (PDF/DOCX/TXT)
-  4. Chunk text
+  4. Chunk text (Projects chunks get heuristic skill_signals in metadata)
   5. Embed chunks with Qwen
-  6. Upsert into Milvus
+  6. Upsert into Milvus (per-chunk section + skill_signals)
   7. Cache the parsed document
   8. Return ingestion summary
 """
@@ -59,6 +59,10 @@ class IngestResumeOutput(BaseModel):
     s3_bucket: str
     chunks_indexed: int
     skills_detected: list
+    project_skills_detected: list = Field(
+        default_factory=list,
+        description="Skills extracted from project/portfolio sections (stored in Milvus and used in ranking)",
+    )
     experience_years: float
     education: list
     email: Optional[str]
@@ -102,6 +106,7 @@ async def ingest_resume(params: IngestResumeInput) -> IngestResumeOutput:
                     s3_bucket=bucket,
                     chunks_indexed=0,
                     skills_detected=cached.skills,
+                    project_skills_detected=getattr(cached, "project_skills", []) or [],
                     experience_years=cached.experience_years,
                     education=cached.education,
                     email=cached.email,
@@ -123,13 +128,33 @@ async def ingest_resume(params: IngestResumeInput) -> IngestResumeOutput:
             s3_bucket=bucket,
         )
 
-        # 6. Chunk
+        # 6. Chunk (skill_signals on Projects rows are computed in chunker — no LLM)
         structured_chunks = chunk_resume_document(
             doc,
             chunk_size=settings.rag.chunk_size,
             overlap=settings.rag.chunk_overlap,
         )
         chunks = [c.text for c in structured_chunks]
+        chunk_sections = [c.section_title for c in structured_chunks]
+        chunk_skill_signals = [str(c.metadata.get("skill_signals") or "") for c in structured_chunks]
+
+        # Aggregate project skill_signals into document metadata for Milvus / filters
+        seen_ps: set[str] = set()
+        agg_ps: list[str] = []
+        for chunk in structured_chunks:
+            if chunk.section_title.lower() != "projects":
+                continue
+            for part in str(chunk.metadata.get("skill_signals") or "").split(","):
+                skill = part.strip()
+                if not skill:
+                    continue
+                skill_key = skill.lower()
+                if skill_key in seen_ps:
+                    continue
+                seen_ps.add(skill_key)
+                agg_ps.append(skill)
+        doc.project_skills = agg_ps
+
         logger.info("tool.ingest_resume.chunking", resume_id=resume_id, n_chunks=len(chunks))
 
         # 7. Embed (with per-chunk cache)
@@ -162,6 +187,8 @@ async def ingest_resume(params: IngestResumeInput) -> IngestResumeOutput:
             metadata=doc.to_metadata(),
             embeddings=ordered_embeddings,
             chunks=chunks,
+            chunk_sections=chunk_sections,
+            chunk_skill_signals=chunk_skill_signals,
         )
 
         # 9. Cache the parsed doc (so re-calls skip re-parsing)
@@ -176,6 +203,7 @@ async def ingest_resume(params: IngestResumeInput) -> IngestResumeOutput:
             resume_id=resume_id,
             candidate=doc.candidate_name,
             chunks=len(chunks),
+            project_skills_count=len(doc.project_skills),
             elapsed_ms=elapsed_ms,
         )
 
@@ -187,6 +215,7 @@ async def ingest_resume(params: IngestResumeInput) -> IngestResumeOutput:
             s3_bucket=bucket,
             chunks_indexed=len(chunks),
             skills_detected=doc.skills,
+            project_skills_detected=doc.project_skills,
             experience_years=doc.experience_years,
             education=doc.education,
             email=doc.email,

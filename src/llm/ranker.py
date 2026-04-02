@@ -37,8 +37,10 @@ _RED_FLAG_PENALTY_CAP = 15.0
 SYSTEM_PROMPT = """You are a strict technical recruiter scoring candidates against ONE job description.
 
 You receive a job title, required/preferred skills, minimum experience, education expectations,
-responsibilities, and for each candidate: structured skills, experience_years, education, vector similarity,
-and resume text (merged chunks when available — may still be truncated).
+responsibilities, and for each candidate: structured skills, **project_skills** (aggregated heuristic signals
+from project chunks), **skills_evidence_in_projects** vs **skills_only_in_skills_bullets** (Skills-section
+tokens that do or do not appear in Projects narrative — strong evidence when listed skills match project work),
+experience_years, education, vector similarity (may already include a small retrieval boost), and resume text.
 
 When experience_years is greater than zero or education is non-empty, treat those structured fields as
 ground truth from the applicant tracking system. Do NOT add red_flags like "lack of experience" or
@@ -48,7 +50,8 @@ experience_fit and education_fit using structured fields plus any supporting tex
 Scoring rules (use the FULL 0–100 range; avoid clustering everyone in the 80s–90s):
 - Typical strong-but-not-perfect matches: about 65–85 on relevant dimensions.
 - Reserve 90–100 for rare, near-perfect alignment on title/domain, skills, and experience together.
-- skills_match: overlap and depth vs JD **required** skills (not just keyword overlap).
+- skills_match: overlap vs JD **required** skills. Prefer candidates where required skills appear in
+  **skills_evidence_in_projects** / **project_skills**, not only in **skills_only_in_skills_bullets**.
 - experience_fit: compares candidate years to JD minimum; penalize if leadership/seniority in a **different domain** does not compensate for wrong track.
 - education_fit: meets or exceeds stated education requirements; use 70 if education is unknown from structured fields and resume_text.
 - overall_relevance: holistic fit to THIS role — **job title and domain matter**. Examples:
@@ -276,14 +279,31 @@ class CandidateRanker:
             for i, c in enumerate(candidates, 1):
                 body = (c.get("merged_chunk_text") or c.get("best_chunk") or "").strip()
                 body = body[:p_body]
+                ps = c.get("project_skills", [])
+                if not isinstance(ps, list):
+                    ps = [x.strip() for x in str(ps or "").split(",") if x.strip()]
+                sip = c.get("skills_in_projects", [])
+                if not isinstance(sip, list):
+                    sip = []
+                sno = c.get("skills_not_in_projects", [])
+                if not isinstance(sno, list):
+                    sno = []
                 summaries.append({
                     "index": i,
                     "s3_key": c.get("s3_key", ""),
                     "candidate_name": c.get("candidate_name", "Unknown"),
                     "skills": c.get("skills", []),
+                    "project_skills": ps,
+                    "skills_evidence_in_projects": sip,
+                    "skills_only_in_skills_bullets": sno,
+                    "skill_boost_multiplier": round(float(c.get("skill_boost_multiplier", 1.0)), 4),
+                    "vector_similarity_score": round(c.get("score", 0), 4),
+                    "vector_similarity_pre_skill_boost": round(
+                        float(c.get("vector_score_pre_boost", c.get("score", 0))),
+                        4,
+                    ),
                     "experience_years": c.get("experience_years", 0),
                     "education": c.get("education", []),
-                    "vector_similarity_score": round(c.get("score", 0), 4),
                     "resume_text": body,
                 })
             cj = json.dumps(summaries, indent=2)
@@ -487,6 +507,11 @@ class CandidateRanker:
             r.setdefault("email", original.get("email"))
             r.setdefault("vector_score", original.get("score"))
             r.setdefault("skills", original.get("skills", []))
+            r.setdefault("project_skills", original.get("project_skills", []))
+            r.setdefault("skills_in_projects", original.get("skills_in_projects", []))
+            r.setdefault("skills_not_in_projects", original.get("skills_not_in_projects", []))
+            r.setdefault("vector_score_pre_boost", original.get("vector_score_pre_boost"))
+            r.setdefault("skill_boost_multiplier", original.get("skill_boost_multiplier", 1.0))
             r.setdefault("experience_years", original.get("experience_years"))
             r.setdefault("education", original.get("education", []))
 

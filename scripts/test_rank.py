@@ -59,6 +59,8 @@ async def run(args):
         flags = f"  ⚠ {', '.join(c.red_flags)}" if c.red_flags else ""
         print(f"  #{c.rank:2d}  {c.candidate_name:<30} {bar} {c.weighted_score:5.1f}/100")
         print(f"       Skills: {', '.join(c.skills[:5])}")
+        if c.project_skills:
+            print(f"       Project skills: {', '.join(c.project_skills[:8])}")
         print(f"       {c.summary}{flags}")
         print()
 

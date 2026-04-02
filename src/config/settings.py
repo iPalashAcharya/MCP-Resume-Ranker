@@ -157,6 +157,25 @@ class RAGSettings(BaseSettings):
         30,
         description="Maximum S3 keys allowed in reference_selected_resume_s3_keys per request.",
     )
+    ranking_skill_boost_enabled: bool = Field(
+        True,
+        description="Apply non-LLM skill boosts on top of vector similarity at rank time.",
+    )
+    ranking_skill_boost_max_multiplier: float = Field(
+        1.3,
+        ge=1.0,
+        description="Max multiplicative factor applied to retrieval score (1.0 = disabled cap).",
+    )
+    ranking_skill_boost_skills_list_vs_projects_weight: float = Field(
+        0.5,
+        ge=0.0,
+        description="Weight of Skills-section tokens found in Projects narrative.",
+    )
+    ranking_skill_boost_jd_vs_signals_weight: float = Field(
+        0.5,
+        ge=0.0,
+        description="Weight of JD skill phrases matching Projects chunk skill_signals.",
+    )
 
 
 class RedisSettings(BaseSettings):

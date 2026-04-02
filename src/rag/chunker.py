@@ -5,15 +5,19 @@ from typing import Any, List
 
 from src.config import settings
 from src.parsers.resume_parser import ResumeDocument, ResumeSection
+from src.rag.skill_signals import extract_skill_signals_from_text
 
 @dataclass
 class ResumeChunk:
     text: str
+    """Full prefixed string embedded and stored in Milvus `chunk_text`."""
+    body: str
+    """Raw section fragment only (no Candidate/Section header) — used for skill_signals."""
     section_title: str
     importance: float
     resume_id: str
     chunk_index: int
-    metadata: dict[str, Any]  # carries resume-level metadata for vector store
+    metadata: dict[str, Any]  # resume-level keys + section, importance, skill_signals
 
 def chunk_resume_document(
     doc: ResumeDocument,
@@ -33,8 +37,15 @@ def chunk_resume_document(
         section_chunks = _chunk_section(section, chunk_size, overlap)
 
         for chunk_text in section_chunks:
+            body = chunk_text.strip()
+            # Heuristic tech-like tokens for Projects chunks only; stored per chunk in Milvus (skill_signals).
+            signals: list[str] = []
+            if section.title.lower() == "projects" and body:
+                signals = extract_skill_signals_from_text(body)
+            skill_sig_csv = ",".join(signals) if signals else ""
             chunks.append(ResumeChunk(
                 text=_prefix(doc.candidate_name, section.title, chunk_text),
+                body=body,
                 section_title=section.title,
                 importance=section.importance,
                 resume_id=doc.resume_id,
@@ -43,6 +54,7 @@ def chunk_resume_document(
                     **base_metadata,
                     "section": section.title,
                     "importance": section.importance,
+                    "skill_signals": skill_sig_csv,
                 },
             ))
             chunk_index += 1
@@ -56,6 +68,7 @@ def chunk_resume_document(
         chunks.append(
             ResumeChunk(
                 text=chunk_text,
+                body=chunk_text.strip(),
                 section_title="General",
                 importance=1.0,
                 resume_id=doc.resume_id,
@@ -64,6 +77,7 @@ def chunk_resume_document(
                     **base_metadata,
                     "section": "General",
                     "importance": 1.0,
+                    "skill_signals": "",
                 },
             )
         )
