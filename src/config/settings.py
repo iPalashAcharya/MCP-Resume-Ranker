@@ -237,6 +237,23 @@ class Settings(BaseSettings):
 
     # Security
     api_secret_key: str = Field("change_me_in_production_min_32_chars")
+    access_keys_db_path: str = Field(
+        "data/access_keys.db",
+        description="SQLite file for hashed MCP access keys (HTTP/SSE only).",
+    )
+    access_keys_require_auth: bool = Field(
+        True,
+        description="When true and transport is SSE/HTTP, require a valid access key.",
+    )
+    access_key_admin_secret: Optional[str] = Field(
+        None,
+        description="If set, enables POST /admin/access-keys to mint keys (Bearer this value).",
+    )
+    access_key_admin_rate_limit_per_minute: int = Field(
+        30,
+        ge=1,
+        description="Per-client-IP cap for admin key-issuance endpoint.",
+    )
     allowed_origins_csv: str = Field(
         default="http://localhost:3000",
         validation_alias="ALLOWED_ORIGINS",

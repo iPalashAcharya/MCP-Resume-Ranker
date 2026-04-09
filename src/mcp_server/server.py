@@ -17,8 +17,14 @@ from typing import Any, AsyncGenerator
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from starlette.applications import Starlette
+from starlette.routing import Mount, Route
 
+from src.auth.access_keys import init_access_keys_db
+from src.auth.admin_routes import AdminRateLimiter, make_admin_issue_handler
+from src.auth.verifier import SQLiteAccessKeyVerifier
 from src.config import configure_logging, get_logger, settings
+from src.config.settings import Transport
 from src.mcp_server.tools.ranking_tool import (
     RankCandidatesInput,
     RankCandidatesOutput,
@@ -45,6 +51,10 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
     """Initialise heavy resources once at startup."""
     logger.info("server.startup", name=settings.mcp.name, version="1.0.0")
 
+    if _needs_access_keys_db():
+        await init_access_keys_db(settings.access_keys_db_path)
+        logger.info("server.access_keys_db_ready", path=settings.access_keys_db_path)
+
     # Pre-load embedding model in background
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, embedder.load)
@@ -64,10 +74,25 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
     logger.info("server.shutdown")
 
 
+def _needs_access_keys_db() -> bool:
+    if settings.mcp.transport == Transport.STDIO:
+        return False
+    return bool(settings.access_keys_require_auth or settings.access_key_admin_secret)
+
+
+def _mcp_http_auth():
+    if settings.mcp.transport == Transport.STDIO:
+        return None
+    if not settings.access_keys_require_auth:
+        return None
+    return SQLiteAccessKeyVerifier(db_path=settings.access_keys_db_path)
+
+
 # ─── MCP App ─────────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
     name=settings.mcp.name,
+    auth=_mcp_http_auth(),
     instructions="""
 Resume Ranker MCP Server.
 
@@ -261,7 +286,34 @@ async def tool_list_indexed() -> dict:
 
 # When running under uvicorn with SSE transport:
 #   uvicorn src.mcp_server.server:app --host 0.0.0.0 --port 8000
-app = mcp.http_app(path="/mcp")
+def _compose_asgi_app():
+    inner = mcp.http_app(path="/mcp")
+    if (
+        settings.mcp.transport != Transport.STDIO
+        and settings.access_key_admin_secret
+    ):
+        limiter = AdminRateLimiter(settings.access_key_admin_rate_limit_per_minute)
+        admin_handler = make_admin_issue_handler(
+            settings.access_keys_db_path,
+            settings.access_key_admin_secret,
+            limiter,
+        )
+        admin_route = Route("/admin/access-keys", endpoint=admin_handler, methods=["POST"])
+
+        @asynccontextmanager
+        async def merged_lifespan(app):
+            async with inner.router.lifespan_context(app):
+                yield
+
+        composed = Starlette(
+            routes=[admin_route, Mount("/", inner)],
+            lifespan=merged_lifespan,
+        )
+        return composed
+    return inner
+
+
+app = _compose_asgi_app()
 
 
 # ─── stdio entrypoint ────────────────────────────────────────────────────────
