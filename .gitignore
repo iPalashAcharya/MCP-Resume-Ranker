@@ -14,6 +14,7 @@ venv/
 env/
 *.egg-info/
 dist/
+data/
 build/
 .mypy_cache/
 .ruff_cache/

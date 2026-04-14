@@ -209,7 +209,7 @@ async def rank_candidates_for_job(params: RankCandidatesInput) -> RankCandidates
     filters = _build_milvus_filters(params)
     retrieved = await vector_store.asearch_resumes(
         query_embedding=jd_embedding,
-        top_k=params.top_k * 3,  # over-fetch to give LLM more candidates
+        top_k=params.top_k * 2,  # over-fetch to give LLM more candidates
     )
 
     # Apply hard skill / experience filters post-retrieval
